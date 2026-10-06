@@ -31,6 +31,36 @@ This project is optimized for practical automation workflows: effects, presets, 
 | Markers | Add single marker (comp/layer), add markers in bulk |
 | Audio | Set channel levels, inspect audio metadata, analyze WAV waveform, detect peaks |
 
+## Script Sandbox (this fork)
+
+This fork lets an MCP client run **any ExtendScript** in After Effects, while keeping file changes inside **one folder you choose per project**. You no longer need a new bridge command for every task.
+
+**How it works**
+
+- **Choose the writable folder:** the bridge panel docks like any AE panel. Open it from `Window -> mcp-bridge-auto.jsx`, and in "Claude's writable folder" click **Browse...** to pick the folder the client may modify for the open project.
+  - The choice is remembered per `.aep`.
+  - A new or unsaved project starts with no folder, so no file writes and no scripts until you pick one.
+  - Only you can set it. Scripts can't change it.
+- **New tools:**
+  - `get-sandbox-folder`: reports the open project and its folder, and confirms which project later commands are meant for.
+  - `run-script-code`: runs inline code. Write it as a function body and use `return` to hand back a value.
+  - `run-script-file`: runs a `.jsx` that's inside the folder.
+- **Every script run:**
+  - saves the project and keeps a rolling backup (newest 10, in `mcp-scripts/backups/`)
+  - runs as one undo step
+  - is archived to `mcp-scripts/` and logged to `mcp-scripts/run-log.txt`
+- **Inside scripts:**
+  - Writes, deletes and renames outside the folder are blocked.
+  - Calls AE can't intercept are refused before the script runs: `system.callSystem`, `app.project.save(path)`, `renderQueue.render()`, `saveFrameToPng`, `$.evalFile`, `eval`.
+  - Use the `sandbox` helper instead: `sandbox.saveAs`, `sandbox.render`, `sandbox.saveFrameToPng`, `sandbox.path`.
+  - Reading and importing files from anywhere still works.
+- **Wrong-project guard:** every command carries the project the client expects. If you switch projects mid-task, the bridge refuses instead of editing the wrong file.
+- **Pause:** tick **Pause** in the panel to refuse all commands without losing the folder.
+
+**This is a guardrail against accidents, not a security sandbox.** Deliberately written ExtendScript can still escape it. Anything that can run `AfterFX.exe -r` on your machine bypasses the panel entirely.
+
+The bridge protocol is documented in [`docs/bridge-protocol.md`](docs/bridge-protocol.md).
+
 ## Requirements
 
 - Adobe After Effects
@@ -46,7 +76,7 @@ In After Effects, enable:
 1. Clone and install:
 
 ```bash
-git clone https://github.com/TheLlamainator/after-effects-mcp.git
+git clone https://github.com/spencerpruitt/after-effects-mcp.git
 cd after-effects-mcp
 npm install
 ```
@@ -281,6 +311,15 @@ Run server directly:
 ```bash
 node build/index.js
 ```
+
+Tests:
+
+```bash
+npm test                                      # path-policy unit tests (no AE needed)
+npm run test:e2e -- --i-saved-my-project      # end-to-end against a running AE with the panel open
+```
+
+The end-to-end suite closes your open project, works in a throwaway one, then reopens yours. Save first. See [`test/e2e/README.md`](test/e2e/README.md).
 
 ## Troubleshooting
 

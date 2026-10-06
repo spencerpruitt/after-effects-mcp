@@ -8,12 +8,14 @@
     "build": "tsc && copyfiles -u 1 \"src/scripts/**/*\" build",
     "start": "node build/index.js",
     "install-bridge": "node install-bridge.js",
-    "postinstall": "npm run build"
+    "postinstall": "npm run build",
+    "test": "node --test test/*.test.mjs",
+    "test:e2e": "node test/e2e/bridge.e2e.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "node-fetch": "^3.3.2",
-    "zod": "^3.22.2"
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^20.17.30",

@@ -1,4 +1,16 @@
-﻿
+﻿// __mcpBridgeIIFE: all panel code runs in one function scope, so user scripts can't clobber panel
+// state. Globals: __mcpBridgeCheck (polled by app.scheduleTask), __mcpBridgeTaskId and __mcpCompileUserCode.
+// The JSON and Date polyfills install globally.
+
+// Unlike standard JS, ExtendScript's new Function can read AND assign the locals of the scope it is
+// called from, so user code must be compiled here at top level, never inside the IIFE below.
+function __mcpCompileUserCode(__mcpCode) {
+    return new Function("sandbox", "system", __mcpCode);
+}
+
+// thisObj is the dockable Panel AE passes when this file is opened from the Window menu.
+(function (thisObj) {
+
 
 
 
@@ -61,6 +73,7 @@ function createTextLayer(args) {
         else if (alignment === "right") { textDocument.justification = ParagraphJustification.RIGHT_JUSTIFY; }
         textProp.setValue(textDocument);
         textLayer.property("Position").setValue(position);
+        if (args.name) { textLayer.name = args.name; }
         textLayer.startTime = startTime;
         if (duration > 0) { textLayer.outPoint = startTime + duration; }
         return JSON.stringify({
@@ -104,6 +117,7 @@ function createShapeLayer(args) {
         if (shapeType === "rectangle") {
             shapePathProperty = groupContents.addProperty("ADBE Vector Shape - Rect");
             shapePathProperty.property("Size").setValue(size);
+            if (args.roundness) { shapePathProperty.property("Roundness").setValue(args.roundness); }
         } else if (shapeType === "ellipse") {
             shapePathProperty = groupContents.addProperty("ADBE Vector Shape - Ellipse");
             shapePathProperty.property("Size").setValue(size);
@@ -291,6 +305,8 @@ function setLayerProperties(args) {
             changedProperties.push("rotation");
         }
         if (opacity !== undefined && opacity !== null) { layer.property("Opacity").setValue(opacity); changedProperties.push("opacity"); }
+        if (args.newName) { layer.name = args.newName; changedProperties.push("name"); }
+        if (args.parentName !== undefined) { layer.parent = args.parentName ? comp.layer(args.parentName) : null; changedProperties.push("parent"); }
         if (startTime !== undefined && startTime !== null) { layer.startTime = startTime; changedProperties.push("startTime"); }
         if (duration !== undefined && duration !== null && duration > 0) {
             var actualStartTime = (startTime !== undefined && startTime !== null) ? startTime : layer.startTime;
@@ -521,6 +537,7 @@ function applyEffect(args) {
         
         var compIndex = args.compIndex || 1; 
         var layerIndex = args.layerIndex || 1; 
+        var resolvedTarget = resolveCompAndLayer(args); compIndex = resolvedTarget.compIndex; layerIndex = resolvedTarget.layerIndex;
         var effectIdentifier = args.effect || args.effectIdentifier; 
         var effectName = args.effectName; 
         var effectMatchName = args.effectMatchName; 
@@ -747,6 +764,17 @@ function serializeEffectProperty(prop, includeValues, currentDepth, maxDepth) {
 function resolveCompAndLayer(args) {
     var compIndex = args.compIndex || 1;
     var layerIndex = args.layerIndex || 1;
+    // Optional name-based targeting (compName / layerName) instead of indices
+    if (args.compName) {
+        for (var ci = 1; ci <= app.project.numItems; ci++) {
+            var it = app.project.item(ci);
+            if (it instanceof CompItem && it.name === args.compName) { compIndex = ci; break; }
+        }
+    }
+    if (args.layerName) {
+        var byName = app.project.item(compIndex).layer(args.layerName);
+        if (byName) { layerIndex = byName.index; }
+    }
 
     var comp = app.project.item(compIndex);
     if (!comp || !(comp instanceof CompItem)) {
@@ -2171,48 +2199,345 @@ if (typeof JSON.stringify !== "function") {
         };
     })();
 }
+// ExtendScript is ES3: no Date.prototype.toISOString.
+if (typeof Date.prototype.toISOString !== "function") {
+    Date.prototype.toISOString = function () {
+        function pad2(n, w) {
+            var s = String(n);
+            while (s.length < w) s = "0" + s;
+            return s;
+        }
+        return this.getUTCFullYear() + "-" + pad2(this.getUTCMonth() + 1, 2) + "-" + pad2(this.getUTCDate(), 2) + "T" +
+            pad2(this.getUTCHours(), 2) + ":" + pad2(this.getUTCMinutes(), 2) + ":" + pad2(this.getUTCSeconds(), 2) + "." +
+            pad2(this.getUTCMilliseconds(), 3) + "Z";
+    };
+}
+// === BEGIN PATH POLICY ===
+// Pure ES3, no AE APIs: the same text is loaded by the Node unit tests (test/pathPolicy.test.mjs).
+var MCPPathPolicy = (function () {
+    // Absolute Windows path -> canonical lowercase form with "/" separators, or null if not absolute/invalid.
+    function normalize(p) {
+        if (p === null || p === undefined) return null;
+        var s = String(p).replace(/\\/g, "/");
+        if (s.length === 0) return null;
+        var prefix;
+        var rest;
+        var m = /^([a-zA-Z]):(\/.*)?$/.exec(s);
+        if (m) {
+            prefix = m[1].toLowerCase() + ":";
+            rest = m[2] || "/";
+        } else if (/^\/\/[^\/]+\/[^\/]+/.test(s)) {
+            var parts = s.substring(2).split("/");
+            prefix = "//" + parts[0].toLowerCase() + "/" + parts[1].toLowerCase();
+            rest = "/" + parts.slice(2).join("/");
+        } else if (/^\/[a-zA-Z](\/|$)/.test(s)) {
+            // ExtendScript URI form: /d/Projects/MyFilm
+            prefix = s.charAt(1).toLowerCase() + ":";
+            rest = s.substring(2) || "/";
+        } else {
+            return null;
+        }
+        var segs = rest.split("/");
+        var out = [];
+        for (var i = 0; i < segs.length; i++) {
+            var seg = segs[i];
+            if (seg === "" || seg === ".") continue;
+            if (seg === "..") {
+                if (out.length === 0) return null;
+                out.pop();
+                continue;
+            }
+            out.push(seg.toLowerCase());
+        }
+        return prefix + "/" + out.join("/");
+    }
+
+    // True when candidate is the folder itself or anything beneath it.
+    function isInside(folder, candidate) {
+        var f = normalize(folder);
+        var c = normalize(candidate);
+        if (f === null || c === null) return false;
+        if (f.charAt(f.length - 1) === "/") f = f.substring(0, f.length - 1);
+        return c === f || c.indexOf(f + "/") === 0;
+    }
+
+    // Static scan for calls AE won't let us intercept at runtime. Returns a reason string, or null if clean.
+    function scanCode(code) {
+        var s = String(code).replace(/sandbox\s*\.\s*\w+\s*\(/g, "sandbox_call(");
+        var rules = [
+            [/callSystem/, "system.callSystem is blocked"],
+            [/\.save\s*\(\s*[^\s)]/, "app.project.save(path) is blocked; use sandbox.saveAs(path)"],
+            [/\.render\s*\(/, "renderQueue.render() is blocked; use sandbox.render()"],
+            [/queueInAME/, "queueInAME is blocked; use sandbox.render()"],
+            [/\.saveFrameToPng\s*\(/, "saveFrameToPng is blocked; use sandbox.saveFrameToPng(comp, time, path)"],
+            [/\.execute\s*\(\s*\)/, "File.execute() is blocked"],
+            [/saveSetting|MCPBridgeSandbox|SANDBOX_SECTION|MCPPathPolicy|WriteGuards|pauseCheckbox|__mcp/, "Changing the bridge's settings, folder or guards from a script is blocked"],
+            // Code loaded these ways would never be scanned; use runScriptFile instead.
+            [/evalFile|#include|(^|[^\w.$])eval\s*\(/, "$.evalFile, #include and eval() are blocked; run other scripts with runScriptFile"]
+        ];
+        for (var i = 0; i < rules.length; i++) {
+            if (rules[i][0].test(s)) return rules[i][1];
+        }
+        return null;
+    }
+
+    return { normalize: normalize, isInside: isInside, scanCode: scanCode };
+})();
+// === END PATH POLICY ===
+
 var aeVersion = parseFloat(app.version);
-var isAE2025OrLater = aeVersion >= 25.0;
-var panel = new Window("palette", "MCP Bridge Auto", undefined);
+// Docked when opened from the Window menu; a floating palette only when run another way (File > Scripts).
+var isDocked = (typeof Panel !== "undefined") && (thisObj instanceof Panel);
+var panel = isDocked ? thisObj : new Window("palette", "MCP Bridge Auto", undefined, { resizeable: true });
 panel.orientation = "column";
 panel.alignChildren = ["fill", "top"];
-panel.spacing = 10;
-panel.margins = 16;
+panel.spacing = isDocked ? 6 : 10;
+panel.margins = isDocked ? 8 : 16;
 var statusText = panel.add("statictext", undefined, "Waiting for commands...");
 statusText.alignment = ["fill", "top"];
 var logPanel = panel.add("panel", undefined, "Command Log");
 logPanel.orientation = "column";
 logPanel.alignChildren = ["fill", "fill"];
 var logText = logPanel.add("edittext", undefined, "", {multiline: true, readonly: true});
-logText.preferredSize.height = 200;
-if (isAE2025OrLater) {
-    var warning = panel.add("statictext", undefined, "AE 2025+: Dockable panels are not supported. Floating window only.");
-    warning.graphics.foregroundColor = warning.graphics.newPen(warning.graphics.PenType.SOLID_COLOR, [1,0.3,0,1], 1);
-}
-var autoRunCheckbox = panel.add("checkbox", undefined, "Auto-run commands");
-autoRunCheckbox.value = true;
-var checkInterval = 2000;
+logText.preferredSize.height = isDocked ? 140 : 200;
+logPanel.alignment = ["fill", "fill"];
+// --- Sandbox: the one folder Claude may modify, chosen per project by the user ---
+var SANDBOX_SECTION = "MCPBridgeSandbox";
+var sandboxPanel = panel.add("panel", undefined, "Claude's writable folder");
+sandboxPanel.orientation = "column";
+sandboxPanel.alignChildren = ["fill", "top"];
+var projectLabel = sandboxPanel.add("statictext", undefined, "Project:");
+var folderLabel = sandboxPanel.add("statictext", undefined, "Folder: Not set");
+projectLabel.preferredSize.width = 380;
+folderLabel.preferredSize.width = 380;
+var sandboxButtons = sandboxPanel.add("group");
+sandboxButtons.orientation = "row";
+var browseButton = sandboxButtons.add("button", undefined, "Browse...");
+var clearButton = sandboxButtons.add("button", undefined, "Clear");
+var pauseCheckbox = panel.add("checkbox", undefined, "Pause Claude (refuse all commands)");
+pauseCheckbox.value = false;
+var checkInterval = 500;
 var isChecking = false;
-function getCommandFilePath() {
-    var userFolder = Folder.myDocuments;
-    var bridgeFolder = new Folder(userFolder.fsName + "/ae-mcp-bridge");
+var lastProcessedId = null;
+var lastUiState = null;
+
+function currentProjectPath() {
+    return (app.project && app.project.file) ? app.project.file.fsName : "";
+}
+
+function sandboxKey(projectPath) {
+    return encodeURIComponent(MCPPathPolicy.normalize(projectPath));
+}
+
+// The folder stored for the open project, or null (unsaved project, or never chosen).
+function getSandboxFolder() {
+    var p = currentProjectPath();
+    if (!p) return null;
+    var key = sandboxKey(p);
+    if (!app.settings.haveSetting(SANDBOX_SECTION, key)) return null;
+    var v = app.settings.getSetting(SANDBOX_SECTION, key);
+    return v ? v : null;
+}
+
+function refreshSandboxUI() {
+    var p = currentProjectPath();
+    var f = getSandboxFolder();
+    var state = p + "|" + f;
+    if (state === lastUiState) return;
+    lastUiState = state;
+    projectLabel.text = "Project: " + (p ? fileDisplayName(app.project.file) : "Untitled (save it to choose a folder)");
+    folderLabel.text = "Folder: " + (f ? f : "Not set - Claude can't write files or run scripts");
+    browseButton.enabled = !!p;
+    clearButton.enabled = !!f;
+}
+
+browseButton.onClick = function () {
+    var p = currentProjectPath();
+    if (!p) return;
+    var start = getSandboxFolder() ? new Folder(getSandboxFolder()) : app.project.file.parent;
+    var picked = start.selectDlg("Choose the folder Claude may modify for " + fileDisplayName(app.project.file));
+    if (picked) {
+        app.settings.saveSetting(SANDBOX_SECTION, sandboxKey(p), picked.fsName);
+        logToPanel("Writable folder set: " + picked.fsName);
+        refreshSandboxUI();
+    }
+};
+
+clearButton.onClick = function () {
+    var p = currentProjectPath();
+    if (!p) return;
+    app.settings.saveSetting(SANDBOX_SECTION, sandboxKey(p), "");
+    logToPanel("Writable folder cleared for " + fileDisplayName(app.project.file));
+    refreshSandboxUI();
+};
+// Bridge folder: %AE_MCP_BRIDGE_DIR%, else %USERPROFILE%\ae-mcp-bridge (local profile, never OneDrive).
+function getBridgeFolder() {
+    var dir = $.getenv("AE_MCP_BRIDGE_DIR");
+    if (!dir) {
+        var userFolder = new Folder($.getenv("USERPROFILE") || Folder.myDocuments.fsName);
+        dir = userFolder.fsName + "/ae-mcp-bridge";
+    }
+    var bridgeFolder = new Folder(dir);
     if (!bridgeFolder.exists) {
         bridgeFolder.create();
     }
-    return bridgeFolder.fsName + "/ae_command.json";
+    return bridgeFolder;
+}
+function getCommandFilePath() {
+    return getBridgeFolder().fsName + "/ae_command.json";
 }
 function getResultFilePath() {
-    var userFolder = Folder.myDocuments;
-    var bridgeFolder = new Folder(userFolder.fsName + "/ae-mcp-bridge");
-    if (!bridgeFolder.exists) {
-        bridgeFolder.create();
-    }
-    return bridgeFolder.fsName + "/ae_mcp_result.json";
+    return getBridgeFolder().fsName + "/ae_mcp_result.json";
 }
+function findCompByName(name) {
+    for (var i = 1; i <= app.project.numItems; i++) {
+        var it = app.project.item(i);
+        if (it instanceof CompItem && it.name === name) { return it; }
+    }
+    throw new Error("Composition not found: " + name);
+}
+
+// args: compName, duration, extendLayers (sets every layer that ended at the old comp end to the new end)
+function setCompDuration(args) {
+    try {
+        var comp = findCompByName(args.compName);
+        var oldDur = comp.duration;
+        comp.duration = args.duration;
+        var extended = [];
+        if (args.extendLayers) {
+            for (var i = 1; i <= comp.numLayers; i++) {
+                var L = comp.layer(i);
+                if (Math.abs(L.outPoint - oldDur) < 0.001) { L.outPoint = args.duration; extended.push(L.name); }
+            }
+        }
+        return JSON.stringify({ status: "success", comp: comp.name, oldDuration: oldDur, duration: comp.duration, extendedLayers: extended }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// args: compName, layerName, effectName, propertyName, keyIndex (default 1), newTime. Keeps value and interpolation.
+function moveEffectKeyframe(args) {
+    try {
+        var comp = findCompByName(args.compName);
+        var layer = comp.layer(args.layerName);
+        if (!layer) { throw new Error("Layer not found: " + args.layerName); }
+        var prop = layer.property("Effects").property(args.effectName).property(args.propertyName);
+        var k = args.keyIndex || 1;
+        var oldTime = prop.keyTime(k), val = prop.keyValue(k);
+        var inI = prop.keyInInterpolationType(k), outI = prop.keyOutInterpolationType(k);
+        prop.removeKey(k);
+        var nk = prop.addKey(args.newTime);
+        prop.setValueAtKey(nk, val);
+        prop.setInterpolationTypeAtKey(nk, inI, outI);
+        return JSON.stringify({ status: "success", layer: layer.name, oldTime: oldTime, newTime: prop.keyTime(nk), numKeys: prop.numKeys }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// args: compName, path, name, position, scale, duration
+function importFileToComp(args) {
+    try {
+        var comp = findCompByName(args.compName);
+        var f = new File(args.path);
+        if (!f.exists) { throw new Error("File not found: " + args.path); }
+        var item = app.project.importFile(new ImportOptions(f));
+        var L = comp.layers.add(item);
+        if (args.name) { L.name = args.name; }
+        if (args.position) { L.property("Position").setValue(args.position); }
+        if (args.scale) { L.property("Scale").setValue(args.scale); }
+        if (args.duration) { L.outPoint = args.duration; }
+        return JSON.stringify({ status: "success", layer: L.name, index: L.index, width: item.width, height: item.height }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// args: compName, layerName, and afterName (place directly below) or beforeName (directly above)
+function moveLayer(args) {
+    try {
+        var comp = findCompByName(args.compName);
+        var L = comp.layer(args.layerName);
+        if (!L) { throw new Error("Layer not found: " + args.layerName); }
+        if (args.afterName) { L.moveAfter(comp.layer(args.afterName)); }
+        else if (args.beforeName) { L.moveBefore(comp.layer(args.beforeName)); }
+        else { throw new Error("Pass afterName or beforeName"); }
+        return JSON.stringify({ status: "success", layer: L.name, index: L.index }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// args: compName, layerName, size [w,h], roundness (optional). Edits the first rectangle in a shape layer.
+function setRectSize(args) {
+    try {
+        var comp = findCompByName(args.compName);
+        var L = comp.layer(args.layerName);
+        if (!L) { throw new Error("Layer not found: " + args.layerName); }
+        var rect = L.property("Contents").property(1).property("Contents").property("ADBE Vector Shape - Rect");
+        if (!rect) { throw new Error("No rectangle in first shape group of " + args.layerName); }
+        if (args.size) { rect.property("Size").setValue(args.size); }
+        if (args.roundness !== undefined) { rect.property("Roundness").setValue(args.roundness); }
+        return JSON.stringify({ status: "success", layer: L.name, size: rect.property("Size").value }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// args: compName, layerName
+function deleteLayer(args) {
+    try {
+        var comp = findCompByName(args.compName);
+        var L = comp.layer(args.layerName);
+        if (!L) { throw new Error("Layer not found: " + args.layerName); }
+        L.remove();
+        return JSON.stringify({ status: "success", deleted: args.layerName, numLayers: comp.numLayers }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
+// args: compName, layerName, propertyName, expressionString
+function setExpressionByName(args) {
+    var comp = findCompByName(args.compName);
+    var compIdx = 0;
+    for (var i = 1; i <= app.project.numItems; i++) { if (app.project.item(i) === comp) { compIdx = i; break; } }
+    var L = comp.layer(args.layerName);
+    if (!L) { return JSON.stringify({ success: false, message: "Layer not found: " + args.layerName }); }
+    return setLayerExpression(compIdx, L.index, args.propertyName, args.expressionString);
+}
+
+function saveProject(args) {
+    try {
+        if (args.path) {
+            var f = new File(args.path);
+            // Saving to a new path must land in the writable folder; saving the open project in place is always allowed.
+            var sameAsOpen = MCPPathPolicy.normalize(f.fsName) === MCPPathPolicy.normalize(currentProjectPath());
+            var folder = getSandboxFolder();
+            if (!sameAsOpen && !(folder && MCPPathPolicy.isInside(folder, f.fsName))) {
+                return JSON.stringify({ status: "error", refused: true, code: folder ? "OUTSIDE_FOLDER" : "NO_FOLDER",
+                    message: "Save path is outside the writable folder (" + (folder || "not set") + "): " + f.fsName });
+            }
+            if (f.exists && !args.overwrite && !sameAsOpen) {
+                return JSON.stringify({ status: "error", code: "FILE_EXISTS", message: "File already exists: " + f.fsName });
+            }
+            app.project.save(f);
+            if (!sameAsOpen) { inheritSandboxFolder(folder); }
+        } else {
+            if (!app.project.file) { throw new Error("Project has never been saved; pass a path."); }
+            app.project.save();
+        }
+        return JSON.stringify({ status: "success", savedTo: app.project.file.fsName, numItems: app.project.numItems }, null, 2);
+    } catch (error) {
+        return JSON.stringify({ status: "error", message: error.toString() }, null, 2);
+    }
+}
+
 function getProjectInfo() {
     var project = app.project;
     var result = {
-        projectName: project.file ? project.file.name : "Untitled Project",
+        projectName: project.file ? fileDisplayName(project.file) : "Untitled Project",
         path: project.file ? project.file.fsName : "",
         numItems: project.numItems,
         bitsPerChannel: project.bitsPerChannel,
@@ -2319,292 +2644,794 @@ function getLayerInfo() {
     
     return JSON.stringify(result, null, 2);
 }
-function executeCommand(command, args) {
-    var result = "";
-    
-    logToPanel("Executing command: " + command);
-    statusText.text = "Running: " + command;
-    panel.update();
-    
+// --- Command gate: Pause, then project confirmation, then project match ---
+var GATE_EXEMPT = { getSandboxFolder: true, getProjectInfo: true };
+
+// File.name is URI-encoded ("SH%20048.aep"); this is the readable form.
+function fileDisplayName(f) {
     try {
-        logToPanel("Attempting to execute: " + command); // Log before switch
-        switch (command) {
-            case "getProjectInfo":
-                result = getProjectInfo();
-                break;
-            case "listCompositions":
-                result = listCompositions();
-                break;
-            case "getLayerInfo":
-                result = getLayerInfo();
-                break;
-            case "createComposition":
-                logToPanel("Calling createComposition function...");
-                result = createComposition(args);
-                logToPanel("Returned from createComposition.");
-                break;
-            case "createTextLayer":
-                logToPanel("Calling createTextLayer function...");
-                result = createTextLayer(args);
-                logToPanel("Returned from createTextLayer.");
-                break;
-            case "createShapeLayer":
-                logToPanel("Calling createShapeLayer function...");
-                result = createShapeLayer(args);
-                logToPanel("Returned from createShapeLayer. Result type: " + typeof result);
-                break;
-            case "createSolidLayer":
-                logToPanel("Calling createSolidLayer function...");
-                result = createSolidLayer(args);
-                logToPanel("Returned from createSolidLayer.");
-                break;
-            case "setLayerProperties":
-                logToPanel("Calling setLayerProperties function...");
-                result = setLayerProperties(args);
-                logToPanel("Returned from setLayerProperties.");
-                break;
-            case "setLayerKeyframe":
-                logToPanel("Calling setLayerKeyframe function...");
-                result = setLayerKeyframe(args.compIndex, args.layerIndex, args.propertyName, args.timeInSeconds, args.value);
-                logToPanel("Returned from setLayerKeyframe.");
-                break;
-            case "setLayerExpression":
-                logToPanel("Calling setLayerExpression function...");
-                result = setLayerExpression(args.compIndex, args.layerIndex, args.propertyName, args.expressionString);
-                logToPanel("Returned from setLayerExpression.");
-                break;
-            case "applyEffect":
-                logToPanel("Calling applyEffect function...");
-                result = applyEffect(args);
-                logToPanel("Returned from applyEffect.");
-                break;
-            case "applyEffectTemplate":
-                logToPanel("Calling applyEffectTemplate function...");
-                result = applyEffectTemplate(args);
-                logToPanel("Returned from applyEffectTemplate.");
-                break;
-            case "listLayerEffects":
-                logToPanel("Calling listLayerEffects function...");
-                result = listLayerEffects(args);
-                logToPanel("Returned from listLayerEffects.");
-                break;
-            case "listAvailableEffects":
-                logToPanel("Calling listAvailableEffects function...");
-                result = listAvailableEffects(args);
-                logToPanel("Returned from listAvailableEffects.");
-                break;
-            case "setEffectProperty":
-                logToPanel("Calling setEffectProperty function...");
-                result = setEffectProperty(args);
-                logToPanel("Returned from setEffectProperty.");
-                break;
-            case "setEffectKeyframe":
-                logToPanel("Calling setEffectKeyframe function...");
-                result = setEffectKeyframe(args);
-                logToPanel("Returned from setEffectKeyframe.");
-                break;
-            case "applyLayerPreset":
-                logToPanel("Calling applyLayerPreset function...");
-                result = applyLayerPreset(args);
-                logToPanel("Returned from applyLayerPreset.");
-                break;
-            case "createAdjustmentLayer":
-                logToPanel("Calling createAdjustmentLayer function...");
-                result = createAdjustmentLayer(args);
-                logToPanel("Returned from createAdjustmentLayer.");
-                break;
-            case "centerLayers":
-                logToPanel("Calling centerLayers function...");
-                result = centerLayers(args);
-                logToPanel("Returned from centerLayers.");
-                break;
-            case "getLayerClipFrames":
-                logToPanel("Calling getLayerClipFrames function...");
-                result = getLayerClipFrames(args);
-                logToPanel("Returned from getLayerClipFrames.");
-                break;
-            case "getLayerAudioInfo":
-                logToPanel("Calling getLayerAudioInfo function...");
-                result = getLayerAudioInfo(args);
-                logToPanel("Returned from getLayerAudioInfo.");
-                break;
-            case "addMarkersFromArray":
-                logToPanel("Calling addMarkersFromArray function...");
-                result = addMarkersFromArray(args);
-                logToPanel("Returned from addMarkersFromArray.");
-                break;
-            case "addMarker":
-                logToPanel("Calling addMarker function...");
-                result = addMarker(args);
-                logToPanel("Returned from addMarker.");
-                break;
-            case "setLayerAudioLevels":
-                logToPanel("Calling setLayerAudioLevels function...");
-                result = setLayerAudioLevels(args);
-                logToPanel("Returned from setLayerAudioLevels.");
-                break;
-            case "removeLayerEffect":
-                logToPanel("Calling removeLayerEffect function...");
-                result = removeLayerEffect(args);
-                logToPanel("Returned from removeLayerEffect.");
-                break;
-            case "bridgeTestEffects":
-                logToPanel("Calling bridgeTestEffects function...");
-                result = bridgeTestEffects(args);
-                logToPanel("Returned from bridgeTestEffects.");
-                break;
-            default:
-                result = JSON.stringify({ error: "Unknown command: " + command });
-        }
-        logToPanel("Execution finished for: " + command); // Log after switch
-        logToPanel("Preparing to write result file...");
-        var resultString = (typeof result === 'string') ? result : JSON.stringify(result);
-        try {
-            var resultObj = JSON.parse(resultString);
-            resultObj._responseTimestamp = new Date().toISOString();
-            resultObj._commandExecuted = command;
-            resultString = JSON.stringify(resultObj, null, 2);
-            logToPanel("Added timestamp to result JSON for tracking freshness.");
-        } catch (parseError) {
-            
-            logToPanel("Could not parse result as JSON to add timestamp: " + parseError.toString());
-            
-        }
-        
-        var resultFile = new File(getResultFilePath());
-        resultFile.encoding = "UTF-8"; 
-        logToPanel("Opening result file for writing...");
-        var opened = resultFile.open("w");
-        if (!opened) {
-            logToPanel("ERROR: Failed to open result file for writing: " + resultFile.fsName);
-            throw new Error("Failed to open result file for writing.");
-        }
-        logToPanel("Writing to result file...");
-        var written = resultFile.write(resultString);
-        if (!written) {
-             logToPanel("ERROR: Failed to write to result file (write returned false): " + resultFile.fsName);
-             
-        }
-        logToPanel("Closing result file...");
-        var closed = resultFile.close();
-         if (!closed) {
-             logToPanel("ERROR: Failed to close result file: " + resultFile.fsName);
-             
-        }
-        logToPanel("Result file write process complete.");
-        
-        logToPanel("Command completed successfully: " + command); 
-        statusText.text = "Command completed: " + command;
-        
-        
-        logToPanel("Updating command status to completed...");
-        updateCommandStatus("completed");
-        logToPanel("Command status updated.");
-        
-    } catch (error) {
-        var errorMsg = "ERROR in executeCommand for '" + command + "': " + error.toString() + (error.line ? " (line: " + error.line + ")" : "");
-        logToPanel(errorMsg); 
-        statusText.text = "Error: " + error.toString();
-        
-        
-        try {
-            logToPanel("Attempting to write ERROR to result file...");
-            var errorResult = JSON.stringify({ 
-                status: "error", 
-                command: command,
-                message: error.toString(),
-                line: error.line,
-                fileName: error.fileName
-            });
-            var errorFile = new File(getResultFilePath());
-            errorFile.encoding = "UTF-8";
-            if (errorFile.open("w")) {
-                errorFile.write(errorResult);
-                errorFile.close();
-                logToPanel("Successfully wrote ERROR to result file.");
-            } else {
-                 logToPanel("CRITICAL ERROR: Failed to open result file to write error!");
-            }
-        } catch (writeError) {
-             logToPanel("CRITICAL ERROR: Failed to write error to result file: " + writeError.toString());
-        }
-        
-        
-        logToPanel("Updating command status to error...");
-        updateCommandStatus("error");
-        logToPanel("Command status updated to error.");
+        return decodeURI(f.name);
+    } catch (e) {
+        return f.name;
     }
 }
 
+function samePath(a, b) {
+    if (!a || !b) return !a && !b;
+    return MCPPathPolicy.normalize(a) === MCPPathPolicy.normalize(b);
+}
 
-function updateCommandStatus(status) {
+// After Claude saves the project to a new path inside the folder, the new project keeps the user's folder choice.
+function inheritSandboxFolder(folder) {
+    var p = currentProjectPath();
+    if (p && folder && MCPPathPolicy.isInside(folder, p)) {
+        app.settings.saveSetting(SANDBOX_SECTION, sandboxKey(p), folder);
+        refreshSandboxUI();
+    }
+}
+
+// ES3 Date.parse can't read ISO strings. Returns ms since epoch, or null.
+function parseIsoTime(s) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z$/.exec(String(s));
+    if (!m) return null;
+    var ms = m[7] ? parseInt((m[7] + "00").substring(0, 3), 10) : 0;
+    return Date.UTC(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10),
+        parseInt(m[4], 10), parseInt(m[5], 10), parseInt(m[6], 10), ms);
+}
+
+var STALE_AFTER_MS = 120000;
+
+function displayProjectName(projectPath) {
+    if (!projectPath) return "an untitled project";
+    var parts = String(projectPath).replace(/\\/g, "/").split("/");
+    return parts[parts.length - 1];
+}
+
+function refusal(code, message, extra) {
+    var r = { status: "error", refused: true, code: code, message: message };
+    if (extra) {
+        for (var k in extra) {
+            if (extra.hasOwnProperty(k)) r[k] = extra[k];
+        }
+    }
+    return r;
+}
+
+// Returns a refusal result object, or null when the command may run.
+function gateCommand(commandData) {
+    if (GATE_EXEMPT[commandData.command] === true) return null;
+    if (pauseCheckbox.value) {
+        return refusal("PAUSED", "Paused: the user has paused Claude in the MCP Bridge panel. Ask the user to untick Pause, then retry.");
+    }
+    var expected = commandData.expectedProject;
+    if (expected === undefined || expected === null) {
+        return refusal("PROJECT_NOT_CONFIRMED", "No project confirmed yet. Call get-sandbox-folder to confirm which project is open in After Effects, then retry.");
+    }
+    var open = currentProjectPath();
+    var nExpected = (expected === "") ? "" : MCPPathPolicy.normalize(expected);
+    var nOpen = (open === "") ? "" : MCPPathPolicy.normalize(open);
+    if (nExpected === null || nExpected !== nOpen) {
+        return refusal("PROJECT_MISMATCH",
+            "Expected " + displayProjectName(expected) + " but " + displayProjectName(open) + " is open. Confirm with the user, then call get-sandbox-folder to switch.",
+            { expectedProject: expected, openProject: open });
+    }
+    return null;
+}
+
+// Read-only, exempt from the gate.
+function getSandboxFolderInfo() {
+    var p = currentProjectPath();
+    var f = getSandboxFolder();
+    var exists = f ? new Folder(f).exists : false;
+    var paused = !!pauseCheckbox.value;
+    return {
+        status: "success",
+        projectPath: p,
+        projectName: p ? fileDisplayName(app.project.file) : "Untitled Project",
+        folder: f,
+        folderExists: exists,
+        paused: paused,
+        scriptsEnabled: !!(f && exists && !paused)
+    };
+}
+
+// --- Result writing ---
+// Strips control characters the JSON polyfill doesn't escape.
+function cleanString(s) {
+    return String(s).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, " ");
+}
+
+function toResultObject(result) {
+    if (result !== null && typeof result === "object" && !(result instanceof Array)) return result;
+    var str = (typeof result === "string") ? result : String(result);
     try {
-        var commandFile = new File(getCommandFilePath());
-        if (commandFile.exists) {
-            commandFile.open("r");
-            var content = commandFile.read();
-            commandFile.close();
-            
-            if (content) {
-                var commandData = JSON.parse(content);
-                commandData.status = status;
-                
-                commandFile.open("w");
-                commandFile.write(JSON.stringify(commandData, null, 2));
-                commandFile.close();
+        var parsed = JSON.parse(str);
+        if (parsed !== null && typeof parsed === "object" && !(parsed instanceof Array)) return parsed;
+        return { result: parsed };
+    } catch (parseError) {
+        return { result: cleanString(str) };
+    }
+}
+
+// tmp -> remove old -> rename. File.rename takes a bare file name.
+// startProject: the open project when the command started. _projectChanged is true only for a
+// finished, successful command after which a different project is open.
+function writeResultAtomic(resultObj, command, commandId, startProject) {
+    var openProject = currentProjectPath();
+    resultObj._commandId = commandId;
+    resultObj._commandExecuted = command;
+    resultObj._responseTimestamp = new Date().toISOString();
+    resultObj._project = openProject;
+    resultObj._projectChanged = resultObj.status !== "error" && resultObj.status !== "running" &&
+        !samePath(startProject, openProject);
+    var text = JSON.stringify(resultObj, null, 2);
+    var targetPath = getResultFilePath();
+    var target = new File(targetPath);
+    var tmp = new File(targetPath.replace(/\.json$/, ".tmp"));
+    tmp.encoding = "UTF-8";
+    if (!tmp.open("w")) throw new Error("Failed to open temp result file: " + tmp.fsName);
+    tmp.write(text);
+    tmp.close();
+    var moved = false;
+    for (var attempt = 0; attempt < 5 && !moved; attempt++) {
+        if (attempt > 0) $.sleep(20);
+        if (target.exists && !target.remove()) continue;
+        moved = tmp.rename(target.name);
+    }
+    if (!moved) {
+        // Last resort: write in place so a result always exists.
+        target.encoding = "UTF-8";
+        if (!target.open("w")) throw new Error("Failed to write result file: " + target.fsName);
+        target.write(text);
+        target.close();
+        try { tmp.remove(); } catch (e) {}
+        logToPanel("Warning: atomic rename failed, wrote result in place.");
+    }
+}
+
+// --- Script runner (runScript / runScriptFile) ---
+function pad(n, width) {
+    var s = String(n);
+    while (s.length < width) s = "0" + s;
+    return s;
+}
+
+function archiveStamp(d) {
+    return d.getFullYear() + pad(d.getMonth() + 1, 2) + pad(d.getDate(), 2) + "-" +
+        pad(d.getHours(), 2) + pad(d.getMinutes(), 2) + pad(d.getSeconds(), 2) + "-" + pad(d.getMilliseconds(), 3);
+}
+
+function safeScriptName(name) {
+    var s = String(name || "script").replace(/[^A-Za-z0-9_\-]+/g, "-").replace(/^-+|-+$/g, "");
+    if (s.length > 60) s = s.substring(0, 60);
+    return s || "script";
+}
+
+function blockedError(message, code) {
+    var e = new Error(message);
+    e.mcpCode = code;
+    return e;
+}
+
+function scriptsFolder(folder) {
+    var f = new Folder(folder + "/mcp-scripts");
+    if (!f.exists) f.create();
+    return f;
+}
+
+// Relative paths resolve against the folder; absolute paths are returned unchanged.
+function resolveInFolder(folder, p) {
+    if (MCPPathPolicy.normalize(p) !== null) return String(p);
+    return new File(folder + "/" + p).fsName;
+}
+
+// Converts a script's return value to something JSON.stringify can always handle.
+function toJsonSafe(value, depth) {
+    if (value === undefined || value === null) return null;
+    var t = typeof value;
+    if (t === "boolean") return value;
+    if (t === "number") return isFinite(value) ? value : null;
+    if (t === "string") return cleanString(value);
+    if (t === "function") return null;
+    if (depth >= 8) return "[depth limit]";
+    if (value instanceof Array) {
+        var arr = [];
+        for (var i = 0; i < value.length; i++) arr.push(toJsonSafe(value[i], depth + 1));
+        return arr;
+    }
+    try {
+        if (value instanceof Date) return value.toISOString();
+        if (value.constructor === Object) {
+            var obj = {};
+            for (var k in value) {
+                if (value.hasOwnProperty(k) && typeof value[k] !== "function") obj[k] = toJsonSafe(value[k], depth + 1);
+            }
+            return obj;
+        }
+        // Host objects (CompItem, File, ...) and other class instances.
+        return cleanString(String(value));
+    } catch (e) {
+        return "[unprintable]";
+    }
+}
+
+// Function-body errors are reported one line high; map to the script's own line numbers.
+function scriptErrorLine(e) {
+    if (!e || e.mcpCode || typeof e.line !== "number") return null;
+    var line = e.line - 1;
+    return line < 1 ? 1 : line;
+}
+
+function makeSandbox(folder) {
+    function checkInside(p, what) {
+        if (!MCPPathPolicy.isInside(folder, p)) {
+            throw blockedError("Blocked: " + what + " outside the writable folder: " + p, "OUTSIDE_FOLDER");
+        }
+    }
+    return {
+        folder: folder,
+        path: function (rel) { return resolveInFolder(folder, rel); },
+        saveAs: function (p, overwrite) {
+            var abs = resolveInFolder(folder, p);
+            checkInside(abs, "save as");
+            var f = new File(abs);
+            if (f.exists && !overwrite) throw blockedError("File already exists: " + f.fsName + " (pass overwrite=true)", "FILE_EXISTS");
+            app.project.save(f);
+            inheritSandboxFolder(folder);
+            return app.project.file ? app.project.file.fsName : f.fsName;
+        },
+        render: function () {
+            var rq = app.project.renderQueue;
+            for (var i = 1; i <= rq.numItems; i++) {
+                var item = rq.item(i);
+                if (item.status !== RQItemStatus.QUEUED) continue;
+                for (var j = 1; j <= item.numOutputModules; j++) {
+                    var om = item.outputModule(j);
+                    if (!om.file) throw blockedError("Blocked: render queue item " + i + " output module " + j + " has no output file", "OUTSIDE_FOLDER");
+                    checkInside(om.file.fsName, "render output");
+                }
+            }
+            rq.render();
+            return true;
+        },
+        saveFrameToPng: function (comp, time, p) {
+            var abs = resolveInFolder(folder, p);
+            checkInside(abs, "saveFrameToPng");
+            return comp.saveFrameToPng(time, new File(abs));
+        }
+    };
+}
+
+// Wraps File/Folder write methods; every original is recorded in `installed` for restoreWriteGuards.
+function installWriteGuards(folder, installed) {
+    function wrap(proto, name, makeGuard) {
+        var orig = proto[name];
+        if (typeof orig !== "function") return;
+        installed.push({ proto: proto, name: name, orig: orig });
+        proto[name] = makeGuard(orig);
+    }
+    function check(p, what) {
+        if (!MCPPathPolicy.isInside(folder, p)) {
+            throw blockedError("Blocked: " + what + " outside the writable folder: " + p, "OUTSIDE_FOLDER");
+        }
+    }
+    function targetPath(target) {
+        return (typeof target === "string") ? new File(target).fsName : target.fsName;
+    }
+    function siblingPath(item, newName) {
+        return item.parent ? item.parent.fsName + "/" + newName : String(newName);
+    }
+    wrap(File.prototype, "open", function (orig) {
+        return function (mode) {
+            if (/[wae]/i.test(String(mode || "r"))) check(this.fsName, "File.open(\"" + mode + "\")");
+            return orig.apply(this, arguments);
+        };
+    });
+    wrap(File.prototype, "remove", function (orig) {
+        return function () {
+            check(this.fsName, "File.remove");
+            return orig.apply(this, arguments);
+        };
+    });
+    wrap(File.prototype, "rename", function (orig) {
+        return function (newName) {
+            check(this.fsName, "File.rename");
+            check(siblingPath(this, newName), "File.rename");
+            return orig.apply(this, arguments);
+        };
+    });
+    wrap(File.prototype, "copy", function (orig) {
+        return function (target) {
+            check(targetPath(target), "File.copy");
+            return orig.apply(this, arguments);
+        };
+    });
+    wrap(File.prototype, "createAlias", function (orig) {
+        return function () {
+            check(this.fsName, "File.createAlias");
+            return orig.apply(this, arguments);
+        };
+    });
+    wrap(File.prototype, "execute", function (orig) {
+        return function () {
+            throw blockedError("Blocked: File.execute() is not allowed in MCP scripts", "BLOCKED_CALL");
+        };
+    });
+    wrap(Folder.prototype, "create", function (orig) {
+        return function () {
+            check(this.fsName, "Folder.create");
+            return orig.apply(this, arguments);
+        };
+    });
+    wrap(Folder.prototype, "remove", function (orig) {
+        return function () {
+            check(this.fsName, "Folder.remove");
+            return orig.apply(this, arguments);
+        };
+    });
+    wrap(Folder.prototype, "rename", function (orig) {
+        return function (newName) {
+            check(this.fsName, "Folder.rename");
+            check(siblingPath(this, newName), "Folder.rename");
+            return orig.apply(this, arguments);
+        };
+    });
+}
+
+function restoreWriteGuards(installed) {
+    for (var i = installed.length - 1; i >= 0; i--) {
+        try {
+            installed[i].proto[installed[i].name] = installed[i].orig;
+        } catch (e) {
+            logToPanel("CRITICAL: failed to restore " + installed[i].name + ": " + e.toString());
+        }
+    }
+    installed.length = 0;
+}
+
+// Copies the saved .aep to <folder>/mcp-scripts/backups/<stamp>_<base>.aep and keeps the newest 10 for that project.
+var BACKUPS_TO_KEEP = 10;
+
+function backupProject(folder) {
+    var src = app.project.file;
+    var base = fileDisplayName(src).replace(/\.aep$/i, "");
+    var dir = new Folder(scriptsFolder(folder).fsName + "/backups");
+    if (!dir.exists && !dir.create()) throw new Error("Could not create " + dir.fsName);
+    var dest = new File(dir.fsName + "/" + archiveStamp(new Date()) + "_" + base + ".aep");
+    if (!src.copy(dest.fsName)) {
+        throw new Error("Could not copy project to " + dest.fsName + (src.error ? ": " + src.error : ""));
+    }
+    pruneBackups(dir, base);
+    return dest.fsName;
+}
+
+function pruneBackups(dir, base) {
+    var suffix = "_" + base + ".aep";
+    var files = dir.getFiles("*.aep");
+    var mine = [];
+    for (var i = 0; i < files.length; i++) {
+        if (!(files[i] instanceof File)) continue;
+        var n = fileDisplayName(files[i]);
+        // <yyyymmdd-hhmmss-mmm> is 19 characters, so the names sort oldest-first.
+        if (/^\d{8}-\d{6}-\d{3}_/.test(n) && n.substring(19) === suffix) mine.push({ name: n, file: files[i] });
+    }
+    mine.sort(function (a, b) { return a.name < b.name ? 1 : (a.name > b.name ? -1 : 0); });
+    for (var j = BACKUPS_TO_KEEP; j < mine.length; j++) {
+        try { mine[j].file.remove(); } catch (e) {}
+    }
+}
+
+function appendRunLog(folder, name, ok, durationMs, message) {
+    try {
+        var log = new File(scriptsFolder(folder).fsName + "/run-log.txt");
+        log.encoding = "UTF-8";
+        if (!log.open("a")) return;
+        log.writeln(new Date().toISOString() + "\t" + name + "\t" + (ok ? "success" : "error") + "\t" +
+            durationMs + "\t" + String(message || "").replace(/[\t\r\n]+/g, " "));
+        log.close();
+    } catch (e) {
+        logToPanel("Could not write run-log: " + e.toString());
+    }
+}
+
+// Returns a result object for runScript / runScriptFile.
+function runScriptCommand(command, args) {
+    var folder = getSandboxFolder();
+    if (!folder) {
+        return refusal("NO_FOLDER", "No writable folder is set for this project. Ask the user to choose one with Browse... in the MCP Bridge panel (the project must be saved first).");
+    }
+    if (!new Folder(folder).exists) {
+        return refusal("FOLDER_MISSING", "The writable folder no longer exists: " + folder + ". Ask the user to choose it again in the MCP Bridge panel.");
+    }
+
+    var code;
+    var name;
+    var archivedAs = null;
+    if (command === "runScriptFile") {
+        if (!args.file) return { status: "error", code: "BAD_ARGS", message: "runScriptFile needs a 'file' argument." };
+        var scriptPath = resolveInFolder(folder, args.file);
+        if (!MCPPathPolicy.isInside(folder, scriptPath)) {
+            return refusal("OUTSIDE_FOLDER", "Script file is outside the writable folder (" + folder + "): " + scriptPath);
+        }
+        var scriptFile = new File(scriptPath);
+        if (!scriptFile.exists) return { status: "error", code: "FILE_NOT_FOUND", message: "Script file not found: " + scriptFile.fsName };
+        scriptFile.encoding = "UTF-8";
+        if (!scriptFile.open("r")) return { status: "error", code: "FILE_NOT_FOUND", message: "Could not open script file: " + scriptFile.fsName };
+        code = scriptFile.read();
+        scriptFile.close();
+        name = safeScriptName(fileDisplayName(scriptFile).replace(/\.(jsx|js)$/i, ""));
+    } else {
+        if (typeof args.code !== "string") return { status: "error", code: "BAD_ARGS", message: "runScript needs a 'code' string argument." };
+        code = args.code;
+        name = safeScriptName(args.name);
+    }
+
+    var blockedReason = MCPPathPolicy.scanCode(code);
+    if (blockedReason) {
+        return refusal("BLOCKED_CALL", "Blocked: " + blockedReason + ".");
+    }
+
+    if (command === "runScript") {
+        var archive = new File(scriptsFolder(folder).fsName + "/" + archiveStamp(new Date()) + "_" + name + ".jsx");
+        archive.encoding = "UTF-8";
+        if (!archive.open("w")) return { status: "error", code: "ARCHIVE_FAILED", message: "Could not write archive file: " + archive.fsName };
+        archive.write(code);
+        archive.close();
+        archivedAs = archive.fsName;
+    }
+
+    if (app.project.file) {
+        try {
+            app.project.save();
+        } catch (saveError) {
+            var saveResult = { status: "error", code: "SAVE_FAILED", message: "Save before run failed, script not run: " + saveError.toString(), line: null };
+            if (archivedAs) saveResult.archivedAs = archivedAs;
+            return saveResult;
+        }
+    }
+
+    // Rolling backup of the just-saved .aep; a failure is reported but doesn't block the run.
+    var backupPath = null;
+    var backupWarning = null;
+    if (app.project.file) {
+        try {
+            backupPath = backupProject(folder);
+        } catch (backupError) {
+            backupWarning = "Backup failed: " + cleanString(backupError.toString());
+            logToPanel(backupWarning);
+        }
+    }
+
+    var startProject = currentProjectPath();
+    var sandbox = makeSandbox(folder);
+    var systemStub = {
+        callSystem: function () {
+            throw blockedError("Blocked: system.callSystem is not allowed in MCP scripts", "BLOCKED_CALL");
+        }
+    };
+    var startTime = new Date().getTime();
+    var fn = null;
+    var runError = null;
+    var returnValue;
+    var installed = [];
+    var undoOpen = false;
+
+    try {
+        fn = __mcpCompileUserCode(code);
+    } catch (syntaxError) {
+        runError = syntaxError;
+    }
+
+    if (fn) {
+        try {
+            installWriteGuards(folder, installed);
+            app.beginUndoGroup("MCP: " + name);
+            undoOpen = true;
+            returnValue = fn(sandbox, systemStub);
+        } catch (e) {
+            runError = e;
+        } finally {
+            if (undoOpen) {
+                try { app.endUndoGroup(); } catch (undoError) {}
+            }
+            restoreWriteGuards(installed);
+        }
+    }
+    var durationMs = new Date().getTime() - startTime;
+
+    var violations = [];
+    var endProject = currentProjectPath();
+    if (endProject && MCPPathPolicy.normalize(endProject) !== MCPPathPolicy.normalize(startProject) &&
+            !MCPPathPolicy.isInside(folder, endProject)) {
+        violations.push("Project file moved outside the writable folder: " + endProject);
+    }
+
+    var result;
+    if (runError) {
+        var isError = runError instanceof Error;
+        var message = cleanString(isError ? runError.toString() : String(runError));
+        result = { status: "error", message: message, line: isError ? scriptErrorLine(runError) : null };
+        if (!fn) result.code = "SYNTAX_ERROR";
+        else result.code = (isError && runError.mcpCode) ? runError.mcpCode : "SCRIPT_ERROR";
+        if (archivedAs) result.archivedAs = archivedAs;
+        if (violations.length) result.sandboxViolations = violations;
+        appendRunLog(folder, name, false, durationMs, message);
+    } else {
+        result = {
+            status: "success",
+            returnValue: toJsonSafe(returnValue, 0),
+            durationMs: durationMs,
+            archivedAs: archivedAs,
+            sandboxViolations: violations
+        };
+        appendRunLog(folder, name, true, durationMs, violations.length ? violations.join("; ") : "");
+    }
+    result.backupPath = backupPath;
+    if (backupWarning) result.backupWarning = backupWarning;
+    return result;
+}
+
+// --- Dispatch ---
+function executeCommand(commandData) {
+    var command = commandData.command;
+    var args = commandData.args || {};
+    var commandId = String(commandData.id || commandData.timestamp || "");
+    var startProject = currentProjectPath();
+    var result;
+
+    try {
+        logToPanel("Command: " + command);
+        // UI refresh is cosmetic and must never stop a command; docked Panels have no update().
+        try {
+            statusText.text = "Running: " + command;
+            if (typeof panel.update === "function") panel.update();
+        } catch (uiError) {}
+
+        var written = parseIsoTime(commandData.timestamp);
+        var ageMs = (written === null) ? 0 : new Date().getTime() - written;
+        var refused = (ageMs > STALE_AFTER_MS)
+            ? refusal("STALE", "This command was written " + Math.round(ageMs / 1000) + " s ago, so it was not run (commands older than " +
+                (STALE_AFTER_MS / 1000) + " s are dropped). Check the project state, then send it again if it is still wanted.")
+            : gateCommand(commandData);
+        if (refused) {
+            result = refused;
+            logToPanel("Refused " + command + " (" + refused.code + ")");
+        } else {
+            switch (command) {
+                case "getSandboxFolder":
+                    result = getSandboxFolderInfo();
+                    break;
+                case "runScript":
+                case "runScriptFile":
+                    writeResultAtomic({ status: "running", message: "Script is running in After Effects." }, command, commandId, startProject);
+                    result = runScriptCommand(command, args);
+                    break;
+                case "getProjectInfo":
+                    result = getProjectInfo();
+                    break;
+                case "setCompDuration":
+                    result = setCompDuration(args);
+                    break;
+                case "moveEffectKeyframe":
+                    result = moveEffectKeyframe(args);
+                    break;
+                case "importFileToComp":
+                    result = importFileToComp(args);
+                    break;
+                case "moveLayer":
+                    result = moveLayer(args);
+                    break;
+                case "setRectSize":
+                    result = setRectSize(args);
+                    break;
+                case "deleteLayer":
+                    result = deleteLayer(args);
+                    break;
+                case "setExpressionByName":
+                    result = setExpressionByName(args);
+                    break;
+                case "saveProject":
+                    result = saveProject(args);
+                    break;
+                case "listCompositions":
+                    result = listCompositions();
+                    break;
+                case "getLayerInfo":
+                    result = getLayerInfo();
+                    break;
+                case "createComposition":
+                    result = createComposition(args);
+                    break;
+                case "createTextLayer":
+                    result = createTextLayer(args);
+                    break;
+                case "createShapeLayer":
+                    result = createShapeLayer(args);
+                    break;
+                case "createSolidLayer":
+                    result = createSolidLayer(args);
+                    break;
+                case "setLayerProperties":
+                    result = setLayerProperties(args);
+                    break;
+                case "setLayerKeyframe":
+                    result = setLayerKeyframe(args.compIndex, args.layerIndex, args.propertyName, args.timeInSeconds, args.value);
+                    break;
+                case "setLayerExpression":
+                    result = setLayerExpression(args.compIndex, args.layerIndex, args.propertyName, args.expressionString);
+                    break;
+                case "applyEffect":
+                    result = applyEffect(args);
+                    break;
+                case "applyEffectTemplate":
+                    result = applyEffectTemplate(args);
+                    break;
+                case "listLayerEffects":
+                    result = listLayerEffects(args);
+                    break;
+                case "listAvailableEffects":
+                    result = listAvailableEffects(args);
+                    break;
+                case "setEffectProperty":
+                    result = setEffectProperty(args);
+                    break;
+                case "setEffectKeyframe":
+                    result = setEffectKeyframe(args);
+                    break;
+                case "applyLayerPreset":
+                    result = applyLayerPreset(args);
+                    break;
+                case "createAdjustmentLayer":
+                    result = createAdjustmentLayer(args);
+                    break;
+                case "centerLayers":
+                    result = centerLayers(args);
+                    break;
+                case "getLayerClipFrames":
+                    result = getLayerClipFrames(args);
+                    break;
+                case "getLayerAudioInfo":
+                    result = getLayerAudioInfo(args);
+                    break;
+                case "addMarkersFromArray":
+                    result = addMarkersFromArray(args);
+                    break;
+                case "addMarker":
+                    result = addMarker(args);
+                    break;
+                case "setLayerAudioLevels":
+                    result = setLayerAudioLevels(args);
+                    break;
+                case "removeLayerEffect":
+                    result = removeLayerEffect(args);
+                    break;
+                case "bridgeTestEffects":
+                    result = bridgeTestEffects(args);
+                    break;
+                default:
+                    result = { status: "error", error: "Unknown command: " + command, message: "Unknown command: " + command };
             }
         }
+    } catch (error) {
+        logToPanel("ERROR in " + command + ": " + error.toString() + (error.line ? " (line: " + error.line + ")" : ""));
+        result = {
+            status: "error",
+            command: command,
+            message: cleanString(error.toString()),
+            line: error.line,
+            fileName: error.fileName
+        };
+    }
+
+    var resultObj = toResultObject(result);
+    var failed = resultObj.status === "error";
+    // Write the result before marking the command done, so a "completed" command always has a result.
+    try {
+        writeResultAtomic(resultObj, command, commandId, startProject);
+    } catch (writeError) {
+        logToPanel("CRITICAL: failed to write result file: " + writeError.toString());
+        failed = true;
+    }
+    updateCommandStatus(failed ? "error" : "completed", commandId);
+
+    try {
+        if (failed) {
+            logToPanel("Error: " + command + (resultObj.message ? " - " + resultObj.message : ""));
+            statusText.text = "Error: " + command;
+        } else {
+            logToPanel("Done: " + command);
+            statusText.text = "Command completed: " + command;
+        }
+    } catch (uiError) {}
+}
+
+// Rewrites the command file's status only while it still holds the command we processed.
+function updateCommandStatus(status, commandId) {
+    try {
+        var commandFile = new File(getCommandFilePath());
+        if (!commandFile.exists) return;
+        commandFile.encoding = "UTF-8";
+        if (!commandFile.open("r")) return;
+        var content = commandFile.read();
+        commandFile.close();
+        if (!content) return;
+        var commandData = JSON.parse(content);
+        if (String(commandData.id || commandData.timestamp || "") !== commandId) return;
+        commandData.status = status;
+        if (!commandFile.open("w")) return;
+        commandFile.write(JSON.stringify(commandData, null, 2));
+        commandFile.close();
     } catch (e) {
         logToPanel("Error updating command status: " + e.toString());
     }
 }
 
 
+// Never throws: it is called from error paths that must still write a result.
 function logToPanel(message) {
-    var timestamp = new Date().toLocaleTimeString();
-    logText.text = timestamp + ": " + message + "\n" + logText.text;
+    try {
+        var timestamp = new Date().toLocaleTimeString();
+        var text = timestamp + ": " + message + "\n" + logText.text;
+        if (text.length > 20000) text = text.substring(0, 20000);
+        logText.text = text;
+    } catch (e) {}
 }
 
 
+var lastCheckError = null;
+
 function checkForCommands() {
-    if (!autoRunCheckbox.value || isChecking) return;
-    
+    if (isChecking) return;
     isChecking = true;
-    
     try {
+        try { refreshSandboxUI(); } catch (uiError) {}
         var commandFile = new File(getCommandFilePath());
         if (commandFile.exists) {
+            commandFile.encoding = "UTF-8";
             commandFile.open("r");
             var content = commandFile.read();
             commandFile.close();
-            
             if (content) {
-                var commandData = (typeof JSON !== "undefined" && JSON.parse)
-                    ? JSON.parse(content)
-                    : eval("(" + content + ")");
-                
-                
-                if (commandData.status === "pending") {
-                    
-                    updateCommandStatus("running");
-                    
-                    
-                    executeCommand(commandData.command, commandData.args || {});
+                var commandData = JSON.parse(content);
+                var commandId = String(commandData.id || commandData.timestamp || "");
+                if (commandData.status === "pending" && commandId !== lastProcessedId) {
+                    lastProcessedId = commandId;
+                    updateCommandStatus("running", commandId);
+                    executeCommand(commandData);
                 }
             }
         }
+        lastCheckError = null;
     } catch (e) {
-        logToPanel("Error checking for commands: " + e.toString());
+        var msg = e.toString();
+        if (msg !== lastCheckError) logToPanel("Error checking for commands: " + msg);
+        lastCheckError = msg;
+    } finally {
+        isChecking = false;
     }
-    
-    isChecking = false;
 }
 
 
+// scheduleTask evaluates its string in global scope, so the poller is exported as $.global.__mcpBridgeCheck.
+// Repeating tasks outlive their window, so a new instance cancels the previous one's task first;
+// a task from an older panel that didn't record its id still calls the global, which now points here.
 function startCommandChecker() {
-    app.scheduleTask("checkForCommands()", checkInterval, true);
+    stopCommandChecker();
+    $.global.__mcpBridgeCheck = checkForCommands;
+    $.global.__mcpBridgeTaskId = app.scheduleTask("__mcpBridgeCheck()", checkInterval, true);
 }
 
+function stopCommandChecker() {
+    if ($.global.__mcpBridgeTaskId) {
+        try { app.cancelTask($.global.__mcpBridgeTaskId); } catch (e) {}
+        $.global.__mcpBridgeTaskId = null;
+    }
+}
+
+
+pauseCheckbox.onClick = function () {
+    logToPanel(pauseCheckbox.value ? "Paused: Claude's commands will be refused." : "Resumed: Claude's commands are accepted.");
+};
 
 var checkButton = panel.add("button", undefined, "Check for Commands Now");
 checkButton.onClick = function() {
@@ -2615,12 +3442,30 @@ checkButton.onClick = function() {
 
 logToPanel("MCP Bridge Auto started");
 logToPanel("Command file: " + getCommandFilePath());
-statusText.text = "Ready - Auto-run is " + (autoRunCheckbox.value ? "ON" : "OFF");
+logToPanel("Result file: " + getResultFilePath());
+refreshSandboxUI();
+statusText.text = "Ready";
 
 
 startCommandChecker();
 
 
-panel.center();
-panel.show();
+if (isDocked) {
+    panel.layout.layout(true);
+    panel.layout.resize();
+    panel.onResizing = panel.onResize = function () { this.layout.resize(); };
+} else {
+    // Closing the floating window stops polling; otherwise the task would keep running with no UI.
+    panel.onClose = function () {
+        if ($.global.__mcpBridgeCheck === checkForCommands) {
+            stopCommandChecker();
+            $.global.__mcpBridgeCheck = function () {};
+        }
+    };
+    panel.onResizing = panel.onResize = function () { this.layout.resize(); };
+    panel.center();
+    panel.show();
+}
+
+})(this);
 

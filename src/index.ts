@@ -24,9 +24,10 @@ const TEMP_DIR = path.join(__dirname, "temp");
 
 
 function getAETempDir(): string {
+  // Must match the panel's folder: %USERPROFILE%\ae-mcp-bridge (kept out of Documents, which OneDrive can redirect).
   const homeDir = os.homedir();
-  const bridgeDir = path.join(homeDir, 'Documents', 'ae-mcp-bridge');
-  
+  const bridgeDir = process.env.AE_MCP_BRIDGE_DIR || path.join(homeDir, 'ae-mcp-bridge');
+
   if (!fs.existsSync(bridgeDir)) {
     fs.mkdirSync(bridgeDir, { recursive: true });
   }
@@ -50,10 +51,22 @@ function readResultsFromTempFile(): string {
       
       const content = fs.readFileSync(tempFilePath, 'utf8');
       console.error(`Result file content length: ${content.length} bytes`);
-      
-      
+
+      let stillRunning = false;
+      try {
+        const parsed = JSON.parse(content);
+        // Reads happen outside the bridge lock; the file can only answer the most recent command.
+        updateConfirmedProjectFromResult(parsed, lastCommandId);
+        notePendingScriptResult(parsed);
+        // A long script legitimately leaves the "running" placeholder untouched for a while.
+        stillRunning = !!parsed && parsed.status === 'running';
+      } catch {
+
+      }
+
+
       const thirtySecondsAgo = new Date(Date.now() - 30 * 1000);
-      if (stats.mtime < thirtySecondsAgo) {
+      if (!stillRunning && stats.mtime < thirtySecondsAgo) {
         console.error(`WARNING: Result file is older than 30 seconds. After Effects may not be updating results.`);
         return JSON.stringify({ 
           warning: "Result file appears to be stale (not recently updated).",
@@ -75,50 +88,240 @@ function readResultsFromTempFile(): string {
 }
 
 
-async function waitForBridgeResult(expectedCommand?: string, timeoutMs: number = 5000, pollMs: number = 250): Promise<string> {
+// Id of the most recent command written by writeCommandFile(). Only get-results (which reads
+// without the bridge lock) relies on it; tool calls match on the id writeCommandFile() returned.
+let lastCommandId: string | undefined;
+// Absolute .aep path ("" for untitled) that After Effects reported in a successful
+// getSandboxFolder / getProjectInfo result (or a Save As of our own). Undefined until confirmed.
+let confirmedProject: string | undefined;
+// Id of a runScript / runScriptFile that was still running when its tool call stopped waiting.
+// While set, every other bridge command is refused so it can't overwrite the running command.
+let pendingScriptId: string | undefined;
+let pendingScriptSince = 0;
+const PENDING_SCRIPT_MAX_MS = 30 * 60 * 1000;
+
+function generateCommandId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// Updates confirmedProject only from a successful result that answers command `commandId`:
+// getSandboxFolder (projectPath), getProjectInfo (path), or any success with _projectChanged === true
+// (_project). Refusals and errors never count.
+function updateConfirmedProjectFromResult(parsed: any, commandId: string | undefined): void {
+  if (!parsed || typeof parsed !== 'object') {
+    return;
+  }
+  if (parsed.refused || parsed.status === 'error' || parsed.error) {
+    return;
+  }
+  if (!commandId || parsed._commandId !== commandId) {
+    return;
+  }
+  const command = parsed._commandExecuted;
+  if (command === 'getSandboxFolder' && parsed.status === 'success' && typeof parsed.projectPath === 'string') {
+    confirmedProject = parsed.projectPath;
+  } else if (command === 'getProjectInfo' && typeof parsed.path === 'string') {
+    confirmedProject = parsed.path;
+  } else if (parsed.status === 'success' && parsed._projectChanged === true && typeof parsed._project === 'string') {
+    confirmedProject = parsed._project;
+  } else {
+    return;
+  }
+  console.error(`Confirmed open project: ${confirmedProject === '' ? '(untitled)' : confirmedProject}`);
+}
+
+// Clears pendingScriptId once a final (non-running) result for it has been seen.
+function notePendingScriptResult(parsed: any): void {
+  if (pendingScriptId && parsed && typeof parsed === 'object' &&
+      parsed._commandId === pendingScriptId && parsed.status !== 'running') {
+    console.error(`Script ${pendingScriptId} finished.`);
+    pendingScriptId = undefined;
+  }
+}
+
+// Returns a refusal message while a script is still running, or undefined.
+function pendingScriptMessage(): string | undefined {
+  if (!pendingScriptId) {
+    return undefined;
+  }
+  if (Date.now() - pendingScriptSince > PENDING_SCRIPT_MAX_MS) {
+    console.error(`Giving up on pending script ${pendingScriptId} after 30 minutes.`);
+    pendingScriptId = undefined;
+    return undefined;
+  }
+  // The result may already be final even if nobody called get-results yet.
+  try {
+    const resultPath = path.join(getAETempDir(), 'ae_mcp_result.json');
+    if (fs.existsSync(resultPath)) {
+      const parsed = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+      updateConfirmedProjectFromResult(parsed, pendingScriptId);
+      notePendingScriptResult(parsed);
+    }
+  } catch {
+
+  }
+  if (!pendingScriptId) {
+    return undefined;
+  }
+  return `A script is still running in After Effects (id ${pendingScriptId}). Call get-results until it finishes.`;
+}
+
+function resultMatchesCommand(parsed: any, commandId: string | undefined, expectedCommand?: string): boolean {
+  if (!parsed || typeof parsed !== 'object') {
+    return false;
+  }
+  if (parsed._commandId !== undefined && parsed._commandId !== null && parsed._commandId !== '') {
+    return commandId !== undefined && parsed._commandId === commandId;
+  }
+  // Older panels don't echo the id; fall back to the command name.
+  return !expectedCommand || parsed._commandExecuted === expectedCommand;
+}
+
+interface WaitOptions {
+  // Keep polling while the matched result reports status "running" (runScript / runScriptFile).
+  waitWhileRunning?: boolean;
+}
+
+async function waitForBridgeResult(commandId: string | undefined, expectedCommand?: string, timeoutMs: number = 5000, pollMs: number = 250, options: WaitOptions = {}): Promise<string> {
   const start = Date.now();
   const resultPath = path.join(getAETempDir(), 'ae_mcp_result.json');
-  let lastSize = -1;
+  let lastContent: string | undefined;
+  let sawRunning = false;
 
   while (Date.now() - start < timeoutMs) {
     if (fs.existsSync(resultPath)) {
       try {
         const content = fs.readFileSync(resultPath, 'utf8');
-        if (content && content.length > 0 && content.length !== lastSize) {
-          lastSize = content.length;
+        if (content && content.length > 0 && content !== lastContent) {
+          lastContent = content;
           try {
             const parsed = JSON.parse(content);
-            if (!expectedCommand || parsed._commandExecuted === expectedCommand) {
-              return content;
+            if (resultMatchesCommand(parsed, commandId, expectedCommand)) {
+              if (options.waitWhileRunning && parsed.status === 'running') {
+                sawRunning = true;
+              } else {
+                updateConfirmedProjectFromResult(parsed, commandId);
+                notePendingScriptResult(parsed);
+                return content;
+              }
             }
           } catch {
-            
+
           }
         }
       } catch {
-        
+
       }
     }
     await new Promise(r => setTimeout(r, pollMs));
+  }
+  if (sawRunning) {
+    return JSON.stringify({
+      status: "running",
+      _commandId: commandId,
+      message: `Script is still running after ${Math.round(timeoutMs / 1000)}s — call get-results later to fetch the final result.`
+    });
   }
   return JSON.stringify({ error: `Timed out waiting for bridge result${expectedCommand ? ` for command '${expectedCommand}'` : ''}.` });
 }
 
 
-function writeCommandFile(command: string, args: Record<string, any> = {}): void {
-  try {
-    const commandFile = path.join(getAETempDir(), 'ae_command.json');
-    const commandData = {
-      command,
-      args,
-      timestamp: new Date().toISOString(),
-      status: "pending"  
-    };
-    fs.writeFileSync(commandFile, JSON.stringify(commandData, null, 2));
-    console.error(`Command "${command}" written to ${commandFile}`);
-  } catch (error) {
-    console.error("Error writing command file:", error);
+// ExtendScript can mangle non-ASCII text when reading the file; escape everything outside ASCII as \uXXXX.
+function toAsciiJson(value: any): string {
+  return JSON.stringify(value, null, 2).replace(/[\u007f-￿]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+}
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+// Writes the command atomically (tmp + rename) and returns its id. Throws if it can't be written.
+function writeCommandFile(command: string, args: Record<string, any> = {}): string {
+  const bridgeDir = getAETempDir();
+  const commandFile = path.join(bridgeDir, 'ae_command.json');
+  const tmpFile = path.join(bridgeDir, 'ae_command.json.tmp');
+  const id = generateCommandId();
+  const commandData: Record<string, any> = {
+    id,
+    command,
+    args,
+    timestamp: new Date().toISOString(),
+    status: "pending"
+  };
+  if (confirmedProject !== undefined) {
+    commandData.expectedProject = confirmedProject;
   }
+  lastCommandId = id;
+  fs.writeFileSync(tmpFile, toAsciiJson(commandData));
+  // The panel may briefly hold the target open while reading it; retry the rename.
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.renameSync(tmpFile, commandFile);
+      break;
+    } catch (error) {
+      if (attempt >= 20) {
+        console.error("Error writing command file:", error);
+        throw error;
+      }
+      sleepSync(25);
+    }
+  }
+  console.error(`Command "${command}" (${id}) written to ${commandFile}`);
+  return id;
+}
+
+
+// Only one bridge command is in flight at a time: every clear -> write -> wait runs through this chain.
+let bridgeChain: Promise<unknown> = Promise.resolve();
+
+function withBridgeLock<T>(fn: () => Promise<T> | T): Promise<T> {
+  const run = bridgeChain.then(() => fn());
+  bridgeChain = run.catch(() => undefined);
+  return run;
+}
+
+interface SendOptions extends WaitOptions {
+  timeoutMs?: number;
+  pollMs?: number;
+}
+
+// Clears the result file, writes the command and waits for its result, holding the bridge lock.
+// Throws if a script is still running in After Effects.
+function sendBridgeCommand(command: string, args: Record<string, any> = {}, options: SendOptions = {}): Promise<string> {
+  return withBridgeLock(async () => {
+    const busy = pendingScriptMessage();
+    if (busy) {
+      throw new Error(busy);
+    }
+    clearResultsFile();
+    const id = writeCommandFile(command, args);
+    const result = await waitForBridgeResult(id, command, options.timeoutMs ?? 7000, options.pollMs ?? 250, options);
+    if (options.waitWhileRunning) {
+      try {
+        const parsed = JSON.parse(result);
+        if (parsed && parsed.status === 'running' && parsed._commandId === id) {
+          pendingScriptId = id;
+          pendingScriptSince = Date.now();
+        }
+      } catch {
+
+      }
+    }
+    return result;
+  });
+}
+
+// Clears the result file and writes the command without waiting (call get-results later).
+// Holds the bridge lock only for clear + write. Throws if a script is still running.
+function queueBridgeCommand(command: string, args: Record<string, any> = {}): Promise<string> {
+  return withBridgeLock(() => {
+    const busy = pendingScriptMessage();
+    if (busy) {
+      throw new Error(busy);
+    }
+    clearResultsFile();
+    return writeCommandFile(command, args);
+  });
 }
 
 
@@ -267,9 +470,7 @@ server.resource(
   "aftereffects://compositions",
   async (uri) => {
     
-    clearResultsFile();
-    writeCommandFile("listCompositions", {});
-    const result = await waitForBridgeResult("listCompositions", 6000, 250);
+    const result = await sendBridgeCommand("listCompositions", {}, { timeoutMs: 6000 });
 
     return {
       contents: [{
@@ -284,7 +485,7 @@ server.resource(
 
 server.tool(
   "run-script",
-  "Run a read-only script in After Effects",
+  "Queue one of the predefined After Effects bridge commands by name (some of them modify the project). Returns immediately; call get-results afterwards to read the outcome. For arbitrary ExtendScript use run-script-code / run-script-file instead.",
   {
     script: z.string().describe("Name of the predefined script to run"),
     parameters: z.record(z.any()).optional().describe("Optional parameters for the script")
@@ -294,6 +495,14 @@ server.tool(
     const allowedScripts = [
       "listCompositions", 
       "getProjectInfo", 
+      "saveProject", 
+      "setExpressionByName", 
+      "setRectSize", 
+      "deleteLayer", 
+      "importFileToComp", 
+      "moveLayer", 
+      "setCompDuration", 
+      "moveEffectKeyframe", 
       "getLayerInfo", 
       "createComposition",
       "createTextLayer",
@@ -318,7 +527,10 @@ server.tool(
       "getLayerAudioInfo",
       "addMarkersFromArray",
       "test-animation",
-      "bridgeTestEffects"
+      "bridgeTestEffects",
+      "getSandboxFolder",
+      "runScript",
+      "runScriptFile"
     ];
     
     if (!allowedScripts.includes(script)) {
@@ -335,11 +547,13 @@ server.tool(
 
     try {
       
-      clearResultsFile();
-      
-      
-      writeCommandFile(script, parameters);
-      
+      const queuedId = await queueBridgeCommand(script, parameters);
+      if (script === "runScript" || script === "runScriptFile") {
+        // Nobody waits for this one; protect it until get-results sees its final result.
+        pendingScriptId = queuedId;
+        pendingScriptSince = Date.now();
+      }
+
       return {
         content: [
           {
@@ -367,7 +581,7 @@ server.tool(
 
 server.tool(
   "get-results",
-  "Get results from the last script executed in After Effects",
+  "Get results from the last command executed in After Effects. Use it to poll a run-script-code / run-script-file that was still running (status \"running\") until the final result appears.",
   {},
   async () => {
     try {
@@ -386,6 +600,157 @@ server.tool(
           {
             type: "text",
             text: `Error getting results: ${String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+);
+
+
+const PROJECT_GATE_GUIDANCE =
+  "If a command is refused with code PROJECT_MISMATCH or PROJECT_NOT_CONFIRMED, do NOT retry blindly: " +
+  "tell the user which project is actually open in After Effects (openProject in the refusal, or call get-sandbox-folder), " +
+  "ask them to confirm it is the one to work on, and only after they confirm call get-sandbox-folder to re-sync, then retry. " +
+  "A PAUSED refusal means the user ticked Pause in the MCP Bridge panel; ask them to untick it. " +
+  "A sandbox.saveAs() of your own that moves the project inside the folder is tracked automatically and does not need a re-sync. " +
+  "While a script is still running, every other bridge command is refused until get-results shows its final result.";
+
+const SCRIPT_SANDBOX_DESCRIPTION =
+  "The code runs as the body of an ExtendScript (ES3) function, so use `return` to hand a value back; " +
+  "the return value is converted to JSON (depth limit 8, host objects become strings) and comes back as returnValue. " +
+  "Before each run the project is saved in place (if it has a file), and the whole run is wrapped in one undo group (\"MCP: <name>\"), " +
+  "so the user can undo it with a single Ctrl+Z. " +
+  "File writes (File.open for write/append/edit, File.remove/rename/copy, Folder.create/remove/rename) are only allowed inside the writable folder " +
+  "the user chose in the MCP Bridge panel for this project; anything else throws \"Blocked: ...\". " +
+  "A `sandbox` helper is available: sandbox.folder (the writable folder path), sandbox.path(rel) (relative path -> absolute path in the folder; absolute paths unchanged), " +
+  "sandbox.saveAs(path, overwrite?) (save the project to a path inside the folder), sandbox.render() (checks every queued output module writes inside the folder, then renders), " +
+  "sandbox.saveFrameToPng(comp, time, path) (save a frame to a path inside the folder). " +
+  "Blocked calls (the script is rejected with BLOCKED_CALL before running) and their replacements: " +
+  "system.callSystem (no replacement; not available), app.project.save(path) -> sandbox.saveAs(path) (plain app.project.save() with no argument is fine), " +
+  "app.project.renderQueue.render() -> sandbox.render(), renderQueue.queueInAME (no replacement), comp.saveFrameToPng -> sandbox.saveFrameToPng(comp, time, path), " +
+  "File.execute (always blocked). " +
+  "Errors return { status: \"error\", code?, message, line } where line is relative to the script's first line. " +
+  "Other refusal codes: NO_FOLDER / FOLDER_MISSING (ask the user to choose a folder in the panel), OUTSIDE_FOLDER. " +
+  "If the script is still running when waitSeconds runs out, the tool says so; call get-results later for the final result. ";
+
+function formatScriptToolResult(result: string): { content: Array<{ type: "text"; text: string }>; isError?: boolean } {
+  let note = "";
+  let isError = false;
+  try {
+    const parsed = JSON.parse(result);
+    if (parsed && typeof parsed === 'object') {
+      if (parsed.status === 'error' || parsed.error) {
+        isError = true;
+      }
+      if (parsed.refused && (parsed.code === 'PROJECT_MISMATCH' || parsed.code === 'PROJECT_NOT_CONFIRMED')) {
+        note = "\n\nRefused by the project gate. Tell the user which project is open in After Effects" +
+          (parsed.openProject !== undefined ? ` (${parsed.openProject === '' ? 'an untitled project' : parsed.openProject})` : "") +
+          " and ask them to confirm before calling get-sandbox-folder to re-sync.";
+      } else if (parsed.code === 'STALE') {
+        isError = true;
+        note = "\n\nThe panel skipped this command because it was more than 120 s old by the time it was read " +
+          "(After Effects was busy or the panel was closed). Nothing ran; call the tool again if it is still wanted.";
+      }
+    }
+  } catch {
+
+  }
+  return {
+    content: [
+      {
+        type: "text",
+        text: result + note
+      }
+    ],
+    ...(isError ? { isError: true } : {})
+  };
+}
+
+
+server.tool(
+  "get-sandbox-folder",
+  "Ask After Effects which project is open and which writable folder the user chose for it in the MCP Bridge panel. " +
+  "Returns { projectPath, projectName, folder (null if the project is unsaved or no folder is chosen), folderExists, paused, scriptsEnabled }. " +
+  "Calling this also CONFIRMS the open project: subsequent commands are sent with that project path and After Effects refuses them if a different project is open by then. " +
+  "Call it before the first run-script-code / run-script-file of a session. " +
+  PROJECT_GATE_GUIDANCE,
+  {},
+  async () => {
+    try {
+      const result = await sendBridgeCommand("getSandboxFolder", {}, { timeoutMs: 7000 });
+      return formatScriptToolResult(result);
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error getting sandbox folder: ${String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+);
+
+
+server.tool(
+  "run-script-code",
+  "Run arbitrary ExtendScript code in After Effects through the MCP Bridge panel. " +
+  "The code is archived to <folder>/mcp-scripts/ and the run is logged to <folder>/mcp-scripts/run-log.txt. " +
+  SCRIPT_SANDBOX_DESCRIPTION +
+  PROJECT_GATE_GUIDANCE,
+  {
+    code: z.string().min(1).describe("ExtendScript function body. Use `return` to hand back a value, e.g. `return app.project.numItems;`."),
+    name: z.string().optional().describe("Short label used for the archived file name, the undo group and the run log (e.g. \"rename-layers\")."),
+    waitSeconds: z.number().int().min(1).max(600).optional().default(30).describe("How long to wait for the script to finish (default 30, max 600). If it is still running after this, call get-results later.")
+  },
+  async ({ code, name, waitSeconds = 30 }) => {
+    try {
+      const args: Record<string, any> = { code };
+      if (name) {
+        args.name = name;
+      }
+      const result = await sendBridgeCommand("runScript", args, { timeoutMs: Math.min(Math.max(waitSeconds, 1), 600) * 1000, waitWhileRunning: true });
+      return formatScriptToolResult(result);
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error running script code: ${String(error)}`
+          }
+        ],
+        isError: true
+      };
+    }
+  }
+);
+
+
+server.tool(
+  "run-script-file",
+  "Run an existing .jsx file from the writable folder in After Effects through the MCP Bridge panel. " +
+  "The file path is relative to the folder (or absolute) and must resolve inside the folder, otherwise it is refused with OUTSIDE_FOLDER. " +
+  "The file's contents are treated exactly like run-script-code: " +
+  SCRIPT_SANDBOX_DESCRIPTION +
+  PROJECT_GATE_GUIDANCE,
+  {
+    file: z.string().min(1).describe("Path to the .jsx file, relative to the writable folder or absolute (must be inside the folder)."),
+    waitSeconds: z.number().int().min(1).max(600).optional().default(30).describe("How long to wait for the script to finish (default 30, max 600). If it is still running after this, call get-results later.")
+  },
+  async ({ file, waitSeconds = 30 }) => {
+    try {
+      const result = await sendBridgeCommand("runScriptFile", { file }, { timeoutMs: Math.min(Math.max(waitSeconds, 1), 600) * 1000, waitWhileRunning: true });
+      return formatScriptToolResult(result);
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error running script file: ${String(error)}`
           }
         ],
         isError: true
@@ -507,6 +872,17 @@ Available scripts:
 - setLayerAudioLevels: Set audio levels (dB) on an audio/AV layer, optionally with keyframes
 - getLayerAudioInfo: Get audio metadata, source file path, existing markers, and audio level keyframes for a layer
 - addMarkersFromArray: Add multiple markers at once from an array of {timeInSeconds, comment, duration, label} objects
+- getSandboxFolder: Open project path and the writable folder chosen for it (prefer the get-sandbox-folder tool)
+- runScript: Run ExtendScript code { code, name? } in the sandbox (prefer the run-script-code tool)
+- runScriptFile: Run a .jsx file { file } from the writable folder (prefer the run-script-file tool)
+
+Script sandbox tools:
+- get-sandbox-folder: Shows the open project and its writable folder, and confirms that project for later commands. Call it first.
+- run-script-code: Runs ExtendScript code as a function body (use \`return\`); waits up to waitSeconds (default 30, max 600)
+- run-script-file: Runs a .jsx file inside the writable folder; same rules as run-script-code
+- File writes are limited to the folder chosen in the MCP Bridge panel; the project is saved and an undo group wraps each run.
+- PROJECT_MISMATCH / PROJECT_NOT_CONFIRMED refusals: tell the user which project is open and confirm before calling get-sandbox-folder to re-sync.
+- While a script is still running, other commands are refused; poll get-results until it finishes.
 
 Effect Templates:
 - gaussian-blur: Simple Gaussian blur effect
@@ -546,7 +922,7 @@ server.tool(
   async (params) => {
     try {
       
-      writeCommandFile("createComposition", params);
+      await queueBridgeCommand("createComposition", params);
       
       return {
         content: [
@@ -585,9 +961,7 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("createAdjustmentLayer", parameters);
-      const result = await waitForBridgeResult("createAdjustmentLayer", 7000, 250);
+      const result = await sendBridgeCommand("createAdjustmentLayer", parameters, { timeoutMs: 7000 });
 
       return {
         content: [
@@ -623,9 +997,7 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("centerLayers", parameters);
-      const result = await waitForBridgeResult("centerLayers", 7000, 250);
+      const result = await sendBridgeCommand("centerLayers", parameters, { timeoutMs: 7000 });
 
       return {
         content: [
@@ -659,9 +1031,7 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("getLayerClipFrames", parameters);
-      const result = await waitForBridgeResult("getLayerClipFrames", 7000, 250);
+      const result = await sendBridgeCommand("getLayerClipFrames", parameters, { timeoutMs: 7000 });
 
       return {
         content: [
@@ -710,7 +1080,7 @@ server.tool(
   async (parameters) => {
     try {
       
-      writeCommandFile("setLayerKeyframe", parameters);
+      await queueBridgeCommand("setLayerKeyframe", parameters);
       
       return {
         content: [
@@ -747,7 +1117,7 @@ server.tool(
   async (parameters) => {
     try {
       
-      writeCommandFile("setLayerExpression", parameters);
+      await queueBridgeCommand("setLayerExpression", parameters);
       
       return {
         content: [
@@ -894,7 +1264,7 @@ server.tool(
   async (parameters) => {
     try {
       
-      writeCommandFile("applyEffect", parameters);
+      await queueBridgeCommand("applyEffect", parameters);
       
       return {
         content: [
@@ -930,14 +1300,12 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("applyEffect", {
+      const result = await sendBridgeCommand("applyEffect", {
         compIndex: parameters.compIndex,
         layerIndex: parameters.layerIndex,
         effect: parameters.effect,
         effectSettings: parameters.effectSettings || {}
-      });
-      const result = await waitForBridgeResult("applyEffect", 7000, 250);
+      }, { timeoutMs: 7000 });
 
       return {
         content: [
@@ -984,7 +1352,7 @@ server.tool(
   async (parameters) => {
     try {
       
-      writeCommandFile("applyEffectTemplate", parameters);
+      await queueBridgeCommand("applyEffectTemplate", parameters);
       
       return {
         content: [
@@ -1021,9 +1389,7 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("listLayerEffects", parameters);
-      const result = await waitForBridgeResult("listLayerEffects", 7000, 250);
+      const result = await sendBridgeCommand("listLayerEffects", parameters, { timeoutMs: 7000 });
 
       return {
         content: [
@@ -1057,9 +1423,7 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("listAvailableEffects", parameters);
-      const result = await waitForBridgeResult("listAvailableEffects", 10000, 250);
+      const result = await sendBridgeCommand("listAvailableEffects", parameters, { timeoutMs: 10000 });
 
       return {
         content: [
@@ -1135,9 +1499,7 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("setEffectProperty", parameters);
-      const result = await waitForBridgeResult("setEffectProperty", 7000, 250);
+      const result = await sendBridgeCommand("setEffectProperty", parameters, { timeoutMs: 7000 });
 
       return {
         content: [
@@ -1212,9 +1574,7 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("setEffectKeyframe", parameters);
-      const result = await waitForBridgeResult("setEffectKeyframe", 7000, 250);
+      const result = await sendBridgeCommand("setEffectKeyframe", parameters, { timeoutMs: 7000 });
 
       return {
         content: [
@@ -1348,9 +1708,7 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("applyLayerPreset", parameters);
-      const result = await waitForBridgeResult("applyLayerPreset", 7000, 250);
+      const result = await sendBridgeCommand("applyLayerPreset", parameters, { timeoutMs: 7000 });
 
       return {
         content: [
@@ -1392,13 +1750,7 @@ server.tool(
   async (parameters) => {
     try {
       
-      writeCommandFile("applyEffect", parameters);
-      
-      
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      
-      const result = readResultsFromTempFile();
+      const result = await sendBridgeCommand("applyEffect", parameters, { timeoutMs: 7000 });
       
       return {
         content: [
@@ -1445,13 +1797,7 @@ server.tool(
   async (parameters) => {
     try {
       
-      writeCommandFile("applyEffectTemplate", parameters);
-      
-      
-      await new Promise(resolve => setTimeout(resolve, 1000));
-      
-      
-      const result = readResultsFromTempFile();
+      const result = await sendBridgeCommand("applyEffectTemplate", parameters, { timeoutMs: 7000 });
       
       return {
         content: [
@@ -1568,10 +1914,7 @@ server.tool(
   async () => {
     try {
       
-      clearResultsFile();
-      
-      
-      writeCommandFile("bridgeTestEffects", {});
+      await queueBridgeCommand("bridgeTestEffects", {});
       
       return {
         content: [
@@ -1610,9 +1953,7 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("removeLayerEffect", parameters);
-      const result = await waitForBridgeResult("removeLayerEffect", 7000, 250);
+      const result = await sendBridgeCommand("removeLayerEffect", parameters, { timeoutMs: 7000 });
       return { content: [{ type: "text", text: result }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error removing effect: ${String(error)}` }], isError: true };
@@ -1637,9 +1978,7 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("addMarker", parameters);
-      const result = await waitForBridgeResult("addMarker", 7000, 250);
+      const result = await sendBridgeCommand("addMarker", parameters, { timeoutMs: 7000 });
       return { content: [{ type: "text", text: result }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error adding marker: ${String(error)}` }], isError: true };
@@ -1660,9 +1999,7 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("setLayerAudioLevels", parameters);
-      const result = await waitForBridgeResult("setLayerAudioLevels", 7000, 250);
+      const result = await sendBridgeCommand("setLayerAudioLevels", parameters, { timeoutMs: 7000 });
       return { content: [{ type: "text", text: result }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error setting audio levels: ${String(error)}` }], isError: true };
@@ -1773,9 +2110,7 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("getLayerAudioInfo", parameters);
-      const result = await waitForBridgeResult("getLayerAudioInfo", 7000, 250);
+      const result = await sendBridgeCommand("getLayerAudioInfo", parameters, { timeoutMs: 7000 });
       return { content: [{ type: "text", text: result }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error getting audio info: ${String(error)}` }], isError: true };
@@ -1837,9 +2172,7 @@ server.tool(
   },
   async (parameters) => {
     try {
-      clearResultsFile();
-      writeCommandFile("addMarkersFromArray", parameters);
-      const result = await waitForBridgeResult("addMarkersFromArray", 10000, 250);
+      const result = await sendBridgeCommand("addMarkersFromArray", parameters, { timeoutMs: 10000 });
       return { content: [{ type: "text", text: result }] };
     } catch (error) {
       return { content: [{ type: "text", text: `Error adding bulk markers: ${String(error)}` }], isError: true };
