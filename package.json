@@ -7,10 +7,17 @@
   "scripts": {
     "build": "tsc && copyfiles -u 1 \"src/scripts/**/*\" build",
     "start": "node build/index.js",
+    "start:ae": "node build/ae.js",
+    "start:premiere": "node build/premiere.js",
     "install-bridge": "node install-bridge.js",
+    "install-premiere-panel": "node scripts/install-premiere-panel.mjs",
+    "install-premiere-sidecar": "node scripts/install-premiere-sidecar.mjs",
+    "scrub-check": "node scripts/scrub-check.mjs",
     "postinstall": "npm run build",
+    "pretest": "npm run build",
     "test": "node --test test/*.test.mjs",
-    "test:e2e": "node test/e2e/bridge.e2e.mjs"
+    "test:e2e": "node test/e2e/bridge.e2e.mjs",
+    "test:e2e:premiere": "node test/e2e/premiere.e2e.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

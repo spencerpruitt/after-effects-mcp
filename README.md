@@ -344,6 +344,138 @@ The end-to-end suite closes your open project, works in a throwaway one, then re
 - Expected without elevated permissions.
 - User AppData script paths are usually sufficient.
 
+## Premiere Pro
+
+A second MCP server, `premiere`, drives Adobe Premiere Pro through a UXP panel, the same way the
+`after-effects` server drives AE. Both servers run side by side in one Claude Code session, so Claude can
+render shots in AE and then import them into Premiere, assemble and trim a sequence, add markers, audio,
+transitions and speed changes, export, and save. Design and protocol: `docs/premiere-bridge-spec.md`.
+
+### Requirements
+
+- Premiere Pro **25.6 or later** (UXP is GA from 25.6). Tested target: **26.5** on Windows 11.
+- Node.js 18+, and this repo built (`npm install`, `npm run build`).
+- Creative Cloud Desktop (it installs the `.ccx` panel package).
+
+### Install the panel
+
+```bash
+npm run install-premiere-panel              # packages build/premiere-mcp-bridge.ccx
+npm run install-premiere-panel -- --install # ...and installs it through Adobe's UPIA command-line installer
+```
+
+If `--install` can't find or run Adobe's Unified Plugin Installer Agent (it may need admin rights), either:
+
+- double-click `build\premiere-mcp-bridge.ccx` (Creative Cloud Desktop asks you to confirm a plugin from outside
+  the Marketplace), or
+- for development, enable **Developer Mode** in Premiere's Plugins settings, then use the UXP Developer Tool:
+  *Add Plugin* → `src/premiere-uxp/manifest.json` → *Load*. Dev-loaded plugins must be reloaded after every
+  Premiere restart.
+
+Then open **Window → UXP Plugins → MCP Bridge** and keep the panel open while you work.
+
+### Register both servers in Claude Code
+
+```bash
+claude mcp add after-effects -- node <repo>/build/ae.js
+claude mcp add premiere -- node <repo>/build/premiere.js
+```
+
+`<repo>` is the absolute path of your clone (for example `D:\Projects\after-effects-mcp`). `build/index.js`
+still works for After Effects, so existing configs don't need to change. Each server has its own lock and its
+own confirmed project, so a long AE render never blocks Premiere commands.
+
+### The panel
+
+- Shows the target (or active) project and its **sandbox folder**, marked "(default)" when it was inherited
+  from a remembered root.
+- **Browse… / Clear / Forget default** set the folder. New projects can only be created inside a remembered
+  default root (for example `D:\Projects\MyFilm\edit\`).
+- **Pause** refuses every command (`PAUSED`) until you resume.
+- **Allow test harness** enables the e2e-only commands. It is unticked at every launch and never saved.
+- A log view lists each command and its result.
+
+### Safety model
+
+- **Targeting by path.** Every command names its project. The panel looks it up among the open projects and
+  never falls back to whichever one is active (`PROJECT_NOT_OPEN`, `PROJECT_UNSAVED`).
+- **Reads anywhere, writes only inside the sandbox folder.** Save As, exports (including Media Encoder jobs,
+  checked when queued), frame grabs, script archives and scratch-disk changes must stay inside the folder
+  (`OUTSIDE_FOLDER`). Premiere's own previews, auto-save, media cache and peak files are exempt.
+- **Save + backup before every change.** Each mutating tool and each script first saves the project and copies
+  the `.prproj` to `<folder>\mcp-scripts\backups\` (the newest 10 are kept). Each typed tool is one undo step;
+  results report `undoSteps` and `backupPath`.
+- **Scripts** (`premiere-run-script-code` / `-file`) run with guarded `fs`, `require` and `ppro` plus a static
+  scan for blocked identifiers (`BLOCKED_CALL`), and are archived with a run log in `<folder>\mcp-scripts\`.
+- **Honest limit:** as with the AE panel, these guards are **best-effort**. Determined code inside a UXP plugin
+  with full file-system access can get around them. The protections that matter are the path targeting, the
+  backup taken before each run, and the fact that you can read every script Claude writes.
+
+### Known gaps
+
+Not reachable from a script, so Claude will ask you to do them by hand: menu commands and keyboard shortcuts,
+rendering previews, creating multicam sequences, a true Nest (UXP only offers a sub-sequence), panel focus and
+workspaces, dismissing arbitrary modal dialogs, applying `.ffx` effect presets, and (unconfirmed) complex
+Lumetri curves. UI automation is deliberately out of scope. Details for script authors are in
+`docs/premiere-uxp-cheatsheet.md`, which Claude reads through `premiere-get-api-help`.
+
+### Sidecar (speed, audio transitions, link/unlink)
+
+Premiere 26.5's UXP API can't change clip speed, add audio transitions (its `TransitionFactory` is
+video-only) or link/unlink clips. Those three go to a small CEP/ExtendScript extension, the **MCP Sidecar**
+(`src/premiere-cep/`), that does exactly those operations and nothing else: there is no arbitrary-code tool.
+The server routes them for you:
+
+| Tool | Goes to |
+|---|---|
+| `premiere-set-speed` | sidecar (`setSpeed`) |
+| `premiere-add-transition` on an audio track (`A1`, `A2`...) | sidecar (`addAudioTransition`); video tracks stay on the UXP panel |
+| `premiere-link-clips { sequence, items: [{ track, index }], link }` | sidecar (`link` / `unlink`) |
+
+If the sidecar isn't running (no heartbeat in the bridge folder in the last 6 s), these tools return
+`NEEDS_SIDECAR_UNAVAILABLE` with the install steps and send nothing.
+
+**Install:**
+
+```bash
+npm run install-premiere-sidecar                                 # dry run: prints exactly what it would change
+npm run install-premiere-sidecar -- --install --enable-debug     # copy the extension + allow unsigned extensions
+```
+
+- It copies `src/premiere-cep` to `%APPDATA%\Adobe\CEP\extensions\com.mcp.premiere.sidecar`.
+- `--enable-debug` sets `HKCU\Software\Adobe\CSXS.12` → `PlayerDebugMode = "1"` (Premiere 26 ships CEP 12).
+  CEP only loads unsigned extensions with this on, and it applies to **every** unsigned CEP extension for
+  your Windows user, not just this one. Skip it if you'd rather sign the extension as a ZXP yourself.
+  `--csxs 12,13` targets other CEP versions.
+- Restart Premiere, open **Window → Extensions (Legacy) → MCP Sidecar** once (you can dock it or close it
+  afterwards), and keep the **MCP Bridge** panel open as well.
+
+**How it stays inside the same safety model:** the sidecar uses the same command protocol (`prx_command.json`
+/ `prx_mcp_result.json`), stale check, project targeting by path and save + rolling backup as the panel. It
+never stores settings: the UXP panel writes a read-only mirror of **Pause** and the open projects' folders to
+`pr_sidecar_state.json`, and the sidecar refuses everything when that mirror is missing or older than 10 s.
+QE and the timeline selection only follow the *active* project, so sidecar edits need the target project in
+front (`TARGET_NOT_ACTIVE` otherwise).
+
+**Caveats:**
+
+- It uses Premiere's QE DOM, which Adobe calls undocumented and unsupported. Every result carries read-back
+  values (speed, transition spans, linked-item counts) so a silent no-op shows up as an error.
+- **CEP sunset:** Adobe stops new CEP Marketplace submissions in December 2027, disables CEP by default in
+  **December 2028** and removes it in December 2029. When CEP goes, the sidecar tools fall back to
+  `NEEDS_SIDECAR_UNAVAILABLE`.
+
+### End-to-end tests
+
+See `test/e2e/README.md`. The Premiere suite runs against throwaway projects under `%TEMP%\pr-mcp-e2e-*`,
+opened next to yours, and needs "Allow test harness" ticked.
+
+### Maintainers: publishing
+
+`npm run scrub-check -- <ref>` (default `public-scrub`) greps every file of `<ref>` and the metadata of commits
+not yet on `fork/main` against an untracked `.scrub-denylist` (one regex per line, case-insensitive). It refuses
+to run without the denylist and exits non-zero on any hit.
+
 ## License
 
 MIT. See `LICENSE`.

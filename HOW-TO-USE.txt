@@ -50,11 +50,27 @@ Use this command setup in your MCP config:
   - Restart Claude/Desktop so MCP reloads.
 
 9) Useful local paths
-- Commands file: C:\Users\llama\Documents\ae-mcp-bridge\ae_command.json
-- Results file: C:\Users\llama\Documents\ae-mcp-bridge\ae_mcp_result.json
+- Bridge folder: %USERPROFILE%\ae-mcp-bridge (override with the AE_MCP_BRIDGE_DIR environment variable)
+- AE: ae_command.json / ae_mcp_result.json
+- Premiere: pr_command.json / pr_mcp_result.json
 
 10) Update cycle when code changes
 - npm run build
 - npm run install-bridge
 - Restart After Effects
 - Restart Claude/Desktop MCP client
+
+11) Premiere Pro (25.6 or later; tested target 26.5)
+- Run: npm run install-premiere-panel
+  This packages build\premiere-mcp-bridge.ccx. Add -- --install to install it with Adobe's UPIA tool,
+  or just double-click the .ccx (Creative Cloud Desktop installs it).
+- In Premiere: Window > UXP Plugins > MCP Bridge. Keep the panel open.
+- Click Browse... in the panel to pick the project's sandbox folder (writes and exports go only there).
+- Register both servers in Claude Code:
+    claude mcp add after-effects -- node <repo>/build/ae.js
+    claude mcp add premiere -- node <repo>/build/premiere.js
+  (build/index.js still works for After Effects.)
+- Ask Claude to call premiere-get-state first. Before a script it reads premiere-get-api-help.
+- Every change saves the project and keeps a backup in <folder>\mcp-scripts\backups\ (newest 10).
+- Not scriptable (do by hand): menu commands/shortcuts, rendering previews, multicam, true Nest,
+  workspaces, modal dialogs, .ffx presets. See README "Premiere Pro" for details.

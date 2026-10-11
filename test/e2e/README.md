@@ -5,7 +5,7 @@
 ## Run
 
 1. Save your work in AE.
-2. Open the bridge panel (`Window -> mcp-bridge-auto.jsx`) and make sure **Pause** is unticked. The panel must be the current build: reinstall it and reopen it after any panel change.
+2. Open the bridge panel (`mcp-bridge-auto.jsx`), tick **Auto-run** and make sure **Pause** is unticked. The panel must be the current build: reinstall it and reopen it after any panel change.
 3. Run:
 
 ```
@@ -89,3 +89,134 @@ Run the file directly with `node`. Don't use `node --test`, because flags and st
     - Commands are refused with `PAUSED`, which takes priority over the `expectedProject` check.
     - The folder is kept.
     - `getSandboxFolder` still answers.
+
+## Premiere
+
+`premiere.e2e.mjs` checks the Premiere Pro bridge (`docs/premiere-bridge-spec.md` section 10) against the real Premiere Pro 2026 with the MCP Bridge UXP panel. Like the AE suite, it is on demand and not run in CI. Every `npm test` also checks its logic, teardown and targeting with a dry run against a fake panel (`test/premiere-e2e-dryrun.test.mjs`).
+
+### Run
+
+1. Save your work in Premiere. The harness never targets your projects, but Premiere's scripting API has no "unsaved changes" flag, so it can't check this for you.
+2. Open the MCP Bridge panel. Tick **Allow test harness**, which resets at every launch, and make sure **Pause** is unticked.
+3. Don't run it while a Claude session is using the Premiere tools, because both write the same `pr_command.json`.
+4. Run:
+
+```
+npm run test:e2e:premiere -- --i-saved-my-project
+npm run test:e2e:premiere -- --i-saved-my-project --interactive     # also the Pause and Undo tests
+npm run test:e2e:premiere -- --i-saved-my-project --only P01,P15     # just these cases
+```
+
+| Flag | Meaning |
+|---|---|
+| `--i-saved-my-project` | Required. Without it the harness explains why it refuses and exits with code 2. |
+| `--interactive` | Runs the Pause test (tick, then untick Pause when asked) and the Undo test (press Ctrl+Z in Premiere when asked). Without this flag they are skipped. |
+| `--only P01,P05` | Runs only the listed cases. Setup and teardown always run. |
+
+| Env var | Default |
+|---|---|
+| `AE_MCP_BRIDGE_DIR` | `%USERPROFILE%\ae-mcp-bridge`. The server, panel and harness all resolve it the same way. |
+| `PR_E2E_EXPORT_PRESET` | Unset. Set it to an `.epr` export preset and P06 exports a full sequence with it. |
+
+The harness also refuses with exit code 2 in three cases:
+- The panel doesn't answer `getState`.
+- `getState` reports `testHarnessEnabled: false`. Tick **Allow test harness** and run again.
+- Pause is ticked.
+
+### What it does to your session
+
+- **Your projects stay open and are never targeted.** Every command carries `expectedProject` set to a throwaway project, or is a gate probe that the panel refuses. The client refuses to write any command whose `expectedProject` or path arguments point outside the temp root. The dry run checks this for every command it sends.
+- **It opens throwaway projects alongside yours.** Everything lives under `%TEMP%\pr-mcp-e2e-<stamp>\`:
+  - `edit\E2E.prproj` is the target, and its sandbox folder is `edit\`. Setup remembers the temp root as a default root (`__e2e_addRoot`), creates the project with `createProject`, then sets its folder (`__e2e_setFolder`).
+  - `second\Second.prproj` is a second open project. Its folder is the temp root, which it gets as the default.
+  - `outside\` must never be written by Premiere. The last case checks this.
+  - `media\` holds the test clips. If ffmpeg is on PATH, the harness generates two 4-second 29.97 clips with audio, a relink target, a 23.976 clip and a 6-second wav. Without ffmpeg, the media-dependent cases are skipped with a message.
+- Premiere makes each newly created project active, so the active project changes while the suite runs. Your projects are still open at the end, which the final `END` line checks.
+- **Teardown always runs**, including after a failure or Ctrl+C. It:
+  - clears the folder settings it wrote (`__e2e_clearFolder`)
+  - forgets the temp root (`__e2e_removeRoot`)
+  - closes every throwaway project without saving (`__e2e_closeProject`)
+  - deletes the temp folder
+
+  If any step fails, it prints what to do by hand: close the listed projects without saving, use "Forget default" in the panel for the temp root, and delete the folder.
+
+### Output
+
+The harness prints one line per case (`PASS`, `FAIL`, `SKIP` or `SOFT`), then a summary. The exit code is 1 if a hard case fails or teardown is incomplete, and 0 otherwise.
+
+- **Hard** cases fail the run.
+- **Soft** cases, and soft checks inside hard cases, cover behaviour whose live semantics are uncertain. They print `SOFT` with the reason and never fail the run. When a hard case passes its hard checks but not its soft ones, it prints `SOFT  ... -- hard checks passed`.
+
+### Cases
+
+The list covers AE cases 1 to 22 where they apply, then the Premiere-specific ones. For a hard case, "Soft:" lists the soft checks inside it.
+
+| Case | Kind | Needs | What it checks |
+|---|---|---|---|
+| P01 | hard | | `getState` reports the target, folder and flags, shows both throwaway projects open, and shows your projects still open. Soft: `app.version` and scratch disks are reported. |
+| P02 | hard | media | Import into `Renders/v001` creates both bins and a re-import is skipped. `getProjectItems` lists the clips, and a missing file returns `FILE_NOT_FOUND`. Soft: undo steps, the 29.97 frame rate. |
+| P03 | hard | | Script `fs` writes inside the folder work. writeFile, append, unlink, rename, copyFile and mkdir outside it return `OUTSIDE_FOLDER`, also through `require("fs")`. Reads outside the folder work. |
+| P04 | hard | | Exports outside the folder are refused: the typed frame and sequence exports, `sandbox.export`, and the guarded `EncoderManager`, `Exporter` and `ProjectConverter`. |
+| P05 | hard | media | A frame export inside the folder writes the file. |
+| P06 | soft | media, preset | A full sequence export with `PR_E2E_EXPORT_PRESET`. |
+| P07 | hard | | `saveProject`: saving in place works. A path outside the folder is refused, and the call returns `FILE_EXISTS` and `BAD_ARGS` where they apply. |
+| P08 | hard | | `sandbox.saveAs` and `project.saveAs` outside the folder are refused. |
+| P09 | soft | | Save As inside the folder retargets the project and carries the folder over. |
+| P10 | hard | | `BLOCKED_CALL` comes both from the static scan list and from `require("child_process")` at run time. |
+| P11 | hard | | Scripts that clobber would-be panel globals don't break the bridge. |
+| P12 | hard | | A `STALE` command doesn't run and is marked `error`. This applies to `getState` too. |
+| P13 | hard | | Each run makes a `<stamp>_E2E.prproj` backup, and only the newest 10 are kept. Typed tools make backups too. |
+| P14 | hard | | `PROJECT_NOT_CONFIRMED`, `PROJECT_UNSAVED` for `""`, and `getState` is exempt. |
+| P15 | hard | | `PROJECT_NOT_OPEN` comes with `openProjects`. Case, separators, the `\\?\` prefix and `..` are tolerated. |
+| P16 | hard | | Targeting by path works while Second.prproj is active. Soft: Second is the active project after it is reopened. |
+| P17 | hard | | `NO_FOLDER` and `FOLDER_MISSING`, for scripts and for mutating typed tools, and the default-root fallback. |
+| P18 | hard | | E2E.prproj is closed and reopened. It returns `PROJECT_NOT_OPEN` while closed, and its folder comes back when reopened. |
+| P19 | hard | | `createProject` returns `FILE_EXISTS`, `BAD_ARGS` and `NOT_IN_DEFAULT_ROOT` where they apply, and a scripted `createProject` outside the folder is refused. If one of your own default roots contains `%TEMP%`, the `NOT_IN_DEFAULT_ROOT` check is skipped with a note. |
+| P20 | hard | | The archive `.js` and the `run-log.txt` lines, for both success and failure. |
+| P21 | hard | | A long script reports `running` first. |
+| P22 | hard | | `SCRIPT_ERROR` and `SYNTAX_ERROR` come with messages. Soft: line numbers. |
+| P23 | hard | | `returnValue` round-trips. Host objects become strings, the depth limit applies, and BigInt values are handled. |
+| P24 | hard | | `runScriptFile`: a file inside the folder runs. Outside the folder returns `OUTSIDE_FOLDER`, and the call also returns `BLOCKED_CALL` and `FILE_NOT_FOUND` where they apply. |
+| P25 | hard | | 20 rapid commands each get one matching result and each runs exactly once. |
+| P26 | hard | | A command written while a script runs is not clobbered and runs afterwards. |
+| P27 | hard | interactive | Pause returns `PAUSED` before the target check, also pauses harness commands, and keeps the folder. |
+| P28 | hard | media | Create a 29.97 sequence from a clip, then build/replace it with trims and check it frame-exact via `getSequence`. Also checks `BAD_TIME`. Soft: the second trimmed clip, in points, linked audio, appending a 23.976 clip. |
+| P29 | hard | media | Bulk markers, timecode, `BAD_TIME` and `BAD_ARGS`. Soft: undo steps, reading markers back, a marker on a clip. |
+| P30 | hard | media | `editItems` move and trim end work, and a ripple move is refused. Soft: edge trims (setIn moves the head, setOut the tail), disable/enable, audio-only remove, ripple remove, linked audio moving along, one undo step. |
+| P31 | hard | media | `placeAudio` on A2, then `setAudio` level and fades. Soft: the out point is honoured. |
+| P32 | hard | media | A video Cross Dissolve. Soft: `getSequence` lists it afterwards. |
+| P33 | hard | media, no sidecar | `setSpeed` and audio transitions return `NEEDS_SIDECAR_UNAVAILABLE`, with no backup and no undo step. |
+| P34 | soft | media, sidecar | Set speed through the sidecar (`prx_*` files). |
+| P35 | soft | media, sidecar | An audio crossfade through the sidecar. |
+| P36 | soft | media, sidecar | Unlink and relink through the sidecar. The command names are provisional. |
+| P37 | hard | | Moving a scratch disk outside the folder or to My Documents is refused, and nothing changes. |
+| P38 | soft | media, interactive | One Ctrl+Z in Premiere removes the marker one typed tool added. |
+| P39 | hard | media | `replaceMedia` relinks and renames, and the project item points at the new file. Soft: trims are kept and the timeline follows. |
+| P40 | hard | | `outside\` holds only the harness's own files. |
+
+**Sidecar-dependent cases.** Speed, audio transitions and link/unlink need the CEP sidecar. P34 to P36 run only when `getState.sidecarAvailable` is true and are skipped otherwise. Without the sidecar, P33 runs instead and checks that these operations refuse cleanly.
+
+**Why the soft ones are soft.** The capability spike on 26.5.2 found these issues:
+- `buildSequence` honoured the first clip's trim duration but not the second clip's in/out (`verified: false`).
+- Project items report an unset in/out sentinel, so "trims kept" across a relink can't be read reliably.
+- `getSequence` failed once after a transition was added.
+
+These haven't been confirmed live yet:
+- Save As with several projects open.
+- Marker colours.
+- Edge-trim semantics.
+- Ripple remove and audio-only remove.
+- Undo-step counts.
+
+When one of these is confirmed live, make its check hard.
+
+### Dry run
+
+With `npm test`, `test/premiere-e2e-dryrun.test.mjs` runs the same case list against a fake panel: the real panel core and typed commands, over the fake `premierepro` model from `test/premiere-fakeppro.mjs` as extended in `test/premiere-e2e-fakepanel.mjs`. It uses a temp `AE_MCP_BRIDGE_DIR`. It checks that:
+- every case passes with no soft notes
+- teardown leaves no folder settings, no default root, no open throwaway project and no temp folder
+- your fake project is never saved or edited
+- every command targets the temp root
+- without media, the media cases skip
+- an injected failure still tears down and exits 1
+- each refusal exits 2

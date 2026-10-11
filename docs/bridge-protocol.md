@@ -19,11 +19,14 @@ Bridge folder: `%AE_MCP_BRIDGE_DIR%` or `%USERPROFILE%\ae-mcp-bridge`.
 
 - `id`: unique per command. Legacy commands without `id` use `timestamp` as the id.
 - `expectedProject`: the absolute path of the .aep Claude believes is open, or `""` for an untitled project. Omitted when the server hasn't confirmed a project yet.
-- `status`: `pending` → `running` → `completed` | `error`. The panel only rewrites the status when the file's `id` still equals the id it is processing. A newer command written meanwhile is never clobbered.
+- `status`: `pending` → `running` → `completed` | `error`. The panel only rewrites the status when the file's `id` still equals the id it is processing. A newer command written meanwhile is never clobbered. Because that id check is a read-then-write, the panel sets the final status **before** it writes the result: the server writes its next command as soon as it sees a result, so no status write may follow the result.
 
 ## Panel processing
 
 - The panel polls every 500 ms. It processes a command when `status === "pending"` and `id !== lastProcessedId`. It reads the command file as UTF-8.
+- **Heartbeat and poll revival.** Every 2 s the poll tick writes `ae_heartbeat.json` (`{ "ts": ISO, "project": path, "taskId": n }`). After Effects silently drops the repeating `scheduleTask` when it fires while AE is in the "modal dialog waiting" state that opening a project from AE's own menus leaves behind when the "Save changes?" prompt was shown (opening a saved project is fine; `app.open` from a script never does this), so:
+  - the panel re-arms its task from a watchdog (panel redraw, focus, mouse move, the "Check for Commands Now" button) whenever no tick has run for 3 s, and exports `$.global.__mcpBridgeRestart` for the server;
+  - before writing a command, the server (`BridgeClient.reviveIfStale`) treats a heartbeat older than 6 s as a dead poll and runs `AfterFX.exe -r <bridge>/ae_kick.jsx` (Windows, only when an AfterFX.exe with a main window is running), then waits up to 10 s for a fresh heartbeat. `-r` queues behind a real modal dialog; if AE is still in the phantom-modal state it shows "Cannot run a script while a modal dialog is waiting for response", which also clears that state. A `NOT_PICKED_UP` timeout reports the heartbeat age and what the revive did.
 - **Stale check**, applied to every command, exempt ones included: if `timestamp` is more than 120 s old, the command is not run. The panel writes `{ "status": "error", "refused": true, "code": "STALE", "message": "..." }` and sets the command's status to `error`. A `timestamp` the panel can't parse is never treated as stale.
 - **Gate**, applied in this order. The exempt read-only commands `getSandboxFolder` and `getProjectInfo` skip it.
   1. The Pause checkbox is on: refused with code `PAUSED`.
@@ -49,11 +52,13 @@ Bridge folder: `%AE_MCP_BRIDGE_DIR%` or `%USERPROFILE%\ae-mcp-bridge`.
 Arguments: `{}`. Returns:
 
 ```json
-{ "status": "success", "projectPath": "...", "projectName": "SH010.aep", "folder": "F:\\...\\SH010" , "folderExists": true, "paused": false, "scriptsEnabled": true }
+{ "status": "success", "projectPath": "...", "projectName": "SH010.aep", "folder": "D:\\...\\SH010", "folderExists": true, "paused": false, "scriptsEnabled": true }
 ```
 
-- `folder` is `null` when the project is unsaved or no folder has been chosen.
+- `folder` is `null` when the project is unsaved, its folder was cleared, or no folder has been chosen and no default folder contains it.
 - `scriptsEnabled` = folder set && folder exists && not paused.
+
+**Default folders:** every folder the user picks with Browse is also remembered as a default (After Effects setting section `MCPBridgeSandboxRoots`, key `roots`, newline-separated). A project with no folder of its own uses the innermost default that contains its file, and the panel shows the folder with "(default)". Clear stores an empty folder for that project, which turns the default off for it alone; "Forget default" removes the default that applies to the open project. Only the panel's buttons change defaults: the script scan blocks the setting section and the helper functions.
 
 ### `runScript`
 
@@ -124,3 +129,37 @@ Arguments: `{ "file": string }`. The path is relative to the folder or absolute,
   - `run-script-file` `{ file, waitSeconds }`
   - If a script is still running when `waitSeconds` runs out, the tool returns "still running — call get-results".
   - A `STALE` refusal is reported as an error, with a note saying nothing ran.
+
+## Premiere
+
+The Premiere Pro server (`src/premiere.ts`) and its UXP panel (`src/premiere-uxp/`) use this same protocol through the shared `src/bridge/` module. Where Premiere differs (targeting by path among open projects, `getState`, the extra refusal codes, `undoSteps`), see `docs/premiere-bridge-spec.md`.
+
+- **Files** (same bridge folder):
+  - `pr_command.json` / `pr_mcp_result.json`: the UXP panel. The server writes `pr_command.json.tmp` and renames it; the panel writes `pr_mcp_result.tmp` and renames it.
+  - `prx_command.json` / `prx_mcp_result.json`: the CEP sidecar, if installed. It has its own lock and files but shares `confirmedProject` with the panel client.
+- **`expectedProject` override:** `WriteOptions.expectedProject` (also on `sendBridgeCommand`'s options) replaces `confirmedProject` for one command. A string targets that project; `null` omits the field from the command file; leaving it `undefined` falls back to `confirmedProject`. The Premiere tools pass the tool's `project` argument this way.
+- **`confirmedProject` rules** come from the app config's `confirmFromResult(parsed, info)`, where `info` says what the command was sent with (`expectedProject`, `explicitProject`, the current `confirmedProject`). It returns a path to confirm, `null` to clear, or `undefined` for the generic `_projectChanged` rule.
+
+### Sidecar files (`prx_*`), heartbeat and state mirror
+
+The CEP sidecar (`src/premiere-cep/`, spec §8) handles only `setSpeed`, `addAudioTransition`, `link` and `unlink`, plus the exempt `ping`.
+
+- **Commands and results** follow the same rules as the panel: 500 ms polling, `pending` and `id !== lastProcessedId`, `STALE` after 120 s, the command's status rewritten only while it still holds the same id, and the result written to `prx_mcp_result.tmp`, then the old `prx_mcp_result.json` removed and the tmp renamed. Every result carries `_commandId`, `_commandExecuted`, `_responseTimestamp`, `_project` (the target path, without the `\?\` prefix) and `_projectChanged` (always `false`: the sidecar never saves to a new path).
+- **Heartbeat** `prx_heartbeat.json`, written atomically by the sidecar every 2 s:
+
+  ```json
+  { "pid": 12345, "ts": "2026-10-07T12:00:00.000Z", "version": "1.0.0" }
+  ```
+
+  The sidecar counts as available while `ts` is less than 6 s old (the file's mtime if `ts` can't be parsed). The server checks the file itself before routing a tool to `prx` and returns `NEEDS_SIDECAR_UNAVAILABLE` (with install steps, nothing written) when it isn't fresh. The UXP panel's `getState` reports the same check as `sidecarAvailable`.
+- **State mirror** `pr_sidecar_state.json`, written atomically by the **UXP panel** on every poll and whenever Pause or a folder changes. The sidecar only reads it and never writes settings:
+
+  ```json
+  { "version": 1, "writer": "uxp", "ts": "2026-10-07T12:00:00.000Z", "paused": false,
+    "projects": [{ "path": "D:\Projects\MyFilm\edit\Edit.prproj", "folder": "D:\Projects\MyFilm\edit" }] }
+  ```
+
+  Only open, saved projects are listed. `folder` is the resolved folder (its own setting, else the innermost default root), or `null`.
+- **Sidecar gate**, in order, after the stale check: the mirror is missing, unreadable or older than 10 s → `SIDECAR_STATE_STALE`; `paused` → `PAUSED`; no `expectedProject` → `PROJECT_NOT_CONFIRMED`; `""` → `PROJECT_UNSAVED`; not among `app.projects` (compared with `normalize`, `\?\` stripped) → `PROJECT_NOT_OPEN` with `openProjects`. Then: argument shapes (`BAD_ARGS`, before any save), the folder from the mirror (`NO_FOLDER` / `FOLDER_MISSING`), `project.save()` (`SAVE_FAILED` stops), and a rolling backup into `<folder>/mcp-scripts/backups` (newest 10; a failure only adds `backupWarning`). Results carry `undoSteps` and `backupPath`.
+- **Host errors** come back as `{ status: "error", code, message }`: `TARGET_NOT_ACTIVE` (QE and the timeline selection only follow the active project), `SEQUENCE_NOT_FOUND`, `AMBIGUOUS_ITEM`, `ITEM_NOT_FOUND`, `BAD_TIME`, `SPEED_NOT_APPLIED` / `TRANSITION_NOT_APPLIED` (the call returned but the read-back shows no change), `QE_UNAVAILABLE`, and `HOST_ERROR` (ExtendScript itself failed, for example "EvalScript error.").
+- **Server routing:** `premiere-set-speed` → `prx setSpeed`; `premiere-add-transition` on an audio track → `prx addAudioTransition`, on a video track → `pr addTransition`; `premiere-link-clips` → `prx link` / `prx unlink`. `premiere-get-results` reads the result file of whichever client (`pr` or `prx`) the last command went to.

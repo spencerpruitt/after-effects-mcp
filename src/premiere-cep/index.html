@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>MCP Sidecar</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; padding: 8px; background: #232323; color: #d6d6d6; font: 11px/1.4 system-ui, sans-serif; }
+    #status { font-weight: 600; margin-bottom: 4px; }
+    #log { white-space: pre-wrap; font-family: Consolas, monospace; font-size: 10px; color: #a8a8a8; max-height: 90vh; overflow: auto; }
+  </style>
+</head>
+<body>
+  <div id="status">MCP Sidecar starting...</div>
+  <div>Speed, audio transitions and link/unlink for Claude. Pause and folders come from the MCP Bridge panel. You can leave this panel docked or closed.</div>
+  <div id="log"></div>
+  <script src="js/core.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>

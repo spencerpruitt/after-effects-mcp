@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MCP Bridge sidecar (B-lite): a minimal CEP extension for the operations Premiere's UXP API can't do
+  (clip speed, audio transitions, link/unlink). See docs/premiere-bridge-spec.md section 8.
+
+  Versions (sources):
+  - ExtensionManifest Version 7.0 and RequiredRuntime CSXS: the CEP 12 cookbook asks for manifest 5.0 or
+    above; Adobe's own extensions bundled with Premiere Pro 2026 use Version="7.0" with RequiredRuntime
+    CSXS 5.0. https://github.com/Adobe-CEP/CEP-Resources/blob/master/CEP_12.x/Documentation/CEP%2012%20HTML%20Extension%20Cookbook.md
+  - Premiere Pro 26.5.2 ships CEP 12 (CEPHtmlEngine 12.0.1, PlugPlug 12.0.1.2), so CSXS 11.0 is satisfied
+    and unsigned loading needs HKCU\Software\Adobe\CSXS.12\PlayerDebugMode = "1".
+  - Host PPRO [26.0,99.9]. CEP is disabled by default from Dec 2028 and removed in Dec 2029:
+    https://blog.developer.adobe.com/en/publish/2026/09/investing-in-the-future-of-creative-cloud-extensibility-uxp-comes-to-our-flagship-applications
+  - Node.js in the panel: CEFCommandLine "enable-nodejs" plus "mixed-context" (cookbook, "Node.js APIs").
+-->
+<ExtensionManifest Version="7.0" ExtensionBundleId="com.mcp.premiere.sidecar" ExtensionBundleVersion="1.0.1"
+    ExtensionBundleName="MCP Bridge Sidecar" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <ExtensionList>
+    <Extension Id="com.mcp.premiere.sidecar.panel" Version="1.0.1" />
+  </ExtensionList>
+  <ExecutionEnvironment>
+    <HostList>
+      <Host Name="PPRO" Version="[26.0,99.9]" />
+    </HostList>
+    <LocaleList>
+      <Locale Code="All" />
+    </LocaleList>
+    <RequiredRuntimeList>
+      <RequiredRuntime Name="CSXS" Version="11.0" />
+    </RequiredRuntimeList>
+  </ExecutionEnvironment>
+  <DispatchInfoList>
+    <Extension Id="com.mcp.premiere.sidecar.panel">
+      <DispatchInfo>
+        <Resources>
+          <MainPath>./index.html</MainPath>
+          <ScriptPath>./host/host.jsx</ScriptPath>
+          <CEFCommandLine>
+            <Parameter>--enable-nodejs</Parameter>
+            <Parameter>--mixed-context</Parameter>
+          </CEFCommandLine>
+        </Resources>
+        <Lifecycle>
+          <AutoVisible>true</AutoVisible>
+          <StartOn>
+            <!-- Start with Premiere so the sidecar runs without the user opening the panel. -->
+            <Event>com.adobe.csxs.events.ApplicationActivate</Event>
+            <Event>applicationActivate</Event>
+          </StartOn>
+        </Lifecycle>
+        <UI>
+          <Type>Panel</Type>
+          <Menu>MCP Sidecar</Menu>
+          <Geometry>
+            <Size>
+              <Height>220</Height>
+              <Width>300</Width>
+            </Size>
+            <MinSize>
+              <Height>80</Height>
+              <Width>160</Width>
+            </MinSize>
+          </Geometry>
+        </UI>
+      </DispatchInfo>
+    </Extension>
+  </DispatchInfoList>
+</ExtensionManifest>

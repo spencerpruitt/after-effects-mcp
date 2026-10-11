@@ -2314,12 +2314,22 @@ var sandboxButtons = sandboxPanel.add("group");
 sandboxButtons.orientation = "row";
 var browseButton = sandboxButtons.add("button", undefined, "Browse...");
 var clearButton = sandboxButtons.add("button", undefined, "Clear");
+var forgetButton = sandboxButtons.add("button", undefined, "Forget default");
 var pauseCheckbox = panel.add("checkbox", undefined, "Pause Claude (refuse all commands)");
 pauseCheckbox.value = false;
 var checkInterval = 500;
 var isChecking = false;
 var lastProcessedId = null;
 var lastUiState = null;
+// Poll liveness. After Effects silently drops the repeating poll task when it fires while AE is in
+// the "modal dialog waiting" state that opening a project from AE's own menus leaves behind for a
+// while ("Cannot run a script while a modal dialog is waiting for response"; app.open from a script
+// doesn't do this). The panel can't catch that, so every tick records its time and writes a heartbeat
+// file for the server, and a watchdog on panel redraw/focus re-arms the task when ticks have stopped.
+var HEARTBEAT_MS = 2000;
+var TICK_STALE_MS = 3000;
+var lastTickMs = 0;
+var lastHeartbeatMs = 0;
 
 function currentProjectPath() {
     return (app.project && app.project.file) ? app.project.file.fsName : "";
@@ -2329,26 +2339,82 @@ function sandboxKey(projectPath) {
     return encodeURIComponent(MCPPathPolicy.normalize(projectPath));
 }
 
-// The folder stored for the open project, or null (unsaved project, or never chosen).
+// Default folders: every folder the user picks with Browse is remembered, and a project saved
+// inside one of them uses it when it has no folder of its own. Names carry the SANDBOX_SECTION /
+// __mcp markers so the script scan blocks them like the per-project setting.
+var SANDBOX_SECTION_ROOTS = "MCPBridgeSandboxRoots";
+
+function __mcpDefaultRoots() {
+    if (!app.settings.haveSetting(SANDBOX_SECTION_ROOTS, "roots")) return [];
+    var v = app.settings.getSetting(SANDBOX_SECTION_ROOTS, "roots");
+    var out = [];
+    var parts = v ? v.split("\n") : [];
+    for (var i = 0; i < parts.length; i++) {
+        if (parts[i]) out.push(parts[i]);
+    }
+    return out;
+}
+
+function __mcpSaveDefaultRoots(roots) {
+    app.settings.saveSetting(SANDBOX_SECTION_ROOTS, "roots", roots.join("\n"));
+}
+
+function __mcpRememberRoot(folder) {
+    var roots = __mcpDefaultRoots();
+    for (var i = 0; i < roots.length; i++) {
+        if (MCPPathPolicy.normalize(roots[i]) === MCPPathPolicy.normalize(folder)) return;
+    }
+    roots.push(folder);
+    __mcpSaveDefaultRoots(roots);
+}
+
+function __mcpForgetRoot(folder) {
+    var roots = __mcpDefaultRoots();
+    var kept = [];
+    for (var i = 0; i < roots.length; i++) {
+        if (MCPPathPolicy.normalize(roots[i]) !== MCPPathPolicy.normalize(folder)) kept.push(roots[i]);
+    }
+    __mcpSaveDefaultRoots(kept);
+}
+
+// The innermost remembered folder that contains the project, or null.
+function __mcpDefaultRootFor(projectPath) {
+    var roots = __mcpDefaultRoots();
+    var best = null;
+    for (var i = 0; i < roots.length; i++) {
+        if (MCPPathPolicy.isInside(roots[i], projectPath) && (!best || roots[i].length > best.length)) best = roots[i];
+    }
+    return best;
+}
+
+// True when the open project has its own entry: a chosen folder, or "" after Clear.
+function hasOwnSandboxSetting(p) {
+    return app.settings.haveSetting(SANDBOX_SECTION, sandboxKey(p));
+}
+
+// The folder for the open project, or null (unsaved, cleared, or none chosen and no default contains it).
 function getSandboxFolder() {
     var p = currentProjectPath();
     if (!p) return null;
-    var key = sandboxKey(p);
-    if (!app.settings.haveSetting(SANDBOX_SECTION, key)) return null;
-    var v = app.settings.getSetting(SANDBOX_SECTION, key);
-    return v ? v : null;
+    if (hasOwnSandboxSetting(p)) {
+        var v = app.settings.getSetting(SANDBOX_SECTION, sandboxKey(p));
+        return v ? v : null;
+    }
+    return __mcpDefaultRootFor(p);
 }
 
 function refreshSandboxUI() {
     var p = currentProjectPath();
     var f = getSandboxFolder();
-    var state = p + "|" + f;
+    var fromDefault = !!(p && f && !hasOwnSandboxSetting(p));
+    var state = p + "|" + f + "|" + fromDefault;
     if (state === lastUiState) return;
     lastUiState = state;
     projectLabel.text = "Project: " + (p ? fileDisplayName(app.project.file) : "Untitled (save it to choose a folder)");
-    folderLabel.text = "Folder: " + (f ? f : "Not set - Claude can't write files or run scripts");
+    folderLabel.text = "Folder: " + (f ? f + (fromDefault ? " (default)" : "") : "Not set - Claude can't write files or run scripts");
     browseButton.enabled = !!p;
     clearButton.enabled = !!f;
+    forgetButton.enabled = fromDefault;
 }
 
 browseButton.onClick = function () {
@@ -2358,16 +2424,28 @@ browseButton.onClick = function () {
     var picked = start.selectDlg("Choose the folder Claude may modify for " + fileDisplayName(app.project.file));
     if (picked) {
         app.settings.saveSetting(SANDBOX_SECTION, sandboxKey(p), picked.fsName);
-        logToPanel("Writable folder set: " + picked.fsName);
+        __mcpRememberRoot(picked.fsName);
+        logToPanel("Writable folder set: " + picked.fsName + " (also the default for projects saved inside it)");
         refreshSandboxUI();
     }
 };
 
+// Clear turns the folder off for this project only, even when it came from a default.
 clearButton.onClick = function () {
     var p = currentProjectPath();
     if (!p) return;
     app.settings.saveSetting(SANDBOX_SECTION, sandboxKey(p), "");
     logToPanel("Writable folder cleared for " + fileDisplayName(app.project.file));
+    refreshSandboxUI();
+};
+
+forgetButton.onClick = function () {
+    var p = currentProjectPath();
+    if (!p || hasOwnSandboxSetting(p)) return;
+    var root = __mcpDefaultRootFor(p);
+    if (!root) return;
+    __mcpForgetRoot(root);
+    logToPanel("No longer a default folder: " + root);
     refreshSandboxUI();
 };
 // Bridge folder: %AE_MCP_BRIDGE_DIR%, else %USERPROFILE%\ae-mcp-bridge (local profile, never OneDrive).
@@ -2388,6 +2466,18 @@ function getCommandFilePath() {
 }
 function getResultFilePath() {
     return getBridgeFolder().fsName + "/ae_mcp_result.json";
+}
+function getHeartbeatFilePath() {
+    return getBridgeFolder().fsName + "/ae_heartbeat.json";
+}
+// { ts, project, taskId }, written every HEARTBEAT_MS by the poll tick. The server treats a stale
+// heartbeat as "the poll task is dead" and re-arms it with AfterFX.exe -r (see __mcpBridgeRestart).
+function writeHeartbeat() {
+    var f = new File(getHeartbeatFilePath());
+    f.encoding = "UTF-8";
+    if (!f.open("w")) return;
+    f.write(JSON.stringify({ ts: new Date().toISOString(), project: currentProjectPath(), taskId: $.global.__mcpBridgeTaskId || null }));
+    f.close();
 }
 function findCompByName(name) {
     for (var i = 1; i <= app.project.numItems; i++) {
@@ -3325,14 +3415,17 @@ function executeCommand(commandData) {
 
     var resultObj = toResultObject(result);
     var failed = resultObj.status === "error";
-    // Write the result before marking the command done, so a "completed" command always has a result.
+    // Mark the command done BEFORE writing the result. The server writes its next command as soon as
+    // it sees this result, and updateCommandStatus is read-then-write, so running it after the result
+    // could overwrite that new command. The server waits on the result file, not on the status.
+    updateCommandStatus(failed ? "error" : "completed", commandId);
     try {
         writeResultAtomic(resultObj, command, commandId, startProject);
     } catch (writeError) {
         logToPanel("CRITICAL: failed to write result file: " + writeError.toString());
+        if (!failed) updateCommandStatus("error", commandId);
         failed = true;
     }
-    updateCommandStatus(failed ? "error" : "completed", commandId);
 
     try {
         if (failed) {
@@ -3384,6 +3477,12 @@ function checkForCommands() {
     if (isChecking) return;
     isChecking = true;
     try {
+        var now = new Date().getTime();
+        lastTickMs = now;
+        if (now - lastHeartbeatMs >= HEARTBEAT_MS) {
+            lastHeartbeatMs = now;
+            try { writeHeartbeat(); } catch (hbError) {}
+        }
         try { refreshSandboxUI(); } catch (uiError) {}
         var commandFile = new File(getCommandFilePath());
         if (commandFile.exists) {
@@ -3415,9 +3514,12 @@ function checkForCommands() {
 // scheduleTask evaluates its string in global scope, so the poller is exported as $.global.__mcpBridgeCheck.
 // Repeating tasks outlive their window, so a new instance cancels the previous one's task first;
 // a task from an older panel that didn't record its id still calls the global, which now points here.
+// __mcpBridgeRestart is for the server's AfterFX.exe -r kick script, which re-arms the task from outside.
 function startCommandChecker() {
     stopCommandChecker();
     $.global.__mcpBridgeCheck = checkForCommands;
+    $.global.__mcpBridgeRestart = startCommandChecker;
+    lastTickMs = new Date().getTime();
     $.global.__mcpBridgeTaskId = app.scheduleTask("__mcpBridgeCheck()", checkInterval, true);
 }
 
@@ -3428,6 +3530,23 @@ function stopCommandChecker() {
     }
 }
 
+// Watchdog: re-arms the poll task when no tick has run for TICK_STALE_MS. Ticks also stop while a
+// real modal dialog is up, so this can restart a live task after a long dialog; that is harmless.
+function ensureCommandChecker() {
+    if (!lastTickMs) return;
+    var age = new Date().getTime() - lastTickMs;
+    if (age <= TICK_STALE_MS) return;
+    logToPanel("Poll task restarted (last poll " + Math.round(age / 1000) + " s ago; After Effects drops it after a project is opened from its menus)");
+    startCommandChecker();
+}
+
+// A zero-size group whose onDraw runs whenever AE repaints the panel (focus, resize, project open).
+var watchdog = panel.add("group");
+watchdog.preferredSize = [1, 1];
+watchdog.onDraw = function () { try { ensureCommandChecker(); } catch (e) {} };
+try { panel.onActivate = function () { try { ensureCommandChecker(); } catch (e) {} }; } catch (e) {}
+try { panel.addEventListener("mousemove", function () { try { ensureCommandChecker(); } catch (e) {} }); } catch (e) {}
+
 
 pauseCheckbox.onClick = function () {
     logToPanel(pauseCheckbox.value ? "Paused: Claude's commands will be refused." : "Resumed: Claude's commands are accepted.");
@@ -3435,7 +3554,8 @@ pauseCheckbox.onClick = function () {
 
 var checkButton = panel.add("button", undefined, "Check for Commands Now");
 checkButton.onClick = function() {
-    logToPanel("Manually checking for commands");
+    logToPanel("Manually checking for commands (poll task re-armed)");
+    startCommandChecker();
     checkForCommands();
 };
 
@@ -3460,6 +3580,7 @@ if (isDocked) {
         if ($.global.__mcpBridgeCheck === checkForCommands) {
             stopCommandChecker();
             $.global.__mcpBridgeCheck = function () {};
+            $.global.__mcpBridgeRestart = function () {};
         }
     };
     panel.onResizing = panel.onResize = function () { this.layout.resize(); };

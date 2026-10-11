@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { padding: 8px; color: var(--uxp-host-text-color); background-color: var(--uxp-host-background-color); font-size: 12px; }
+    .section { border: 1px solid var(--uxp-host-border-color, #555); border-radius: 4px; padding: 8px; margin-bottom: 8px; }
+    .label { display: block; margin-bottom: 4px; word-break: break-all; }
+    .muted { opacity: 0.7; }
+    .row { display: flex; flex-direction: row; flex-wrap: wrap; margin-top: 6px; }
+    .row sp-button { margin-right: 6px; margin-bottom: 4px; }
+    #status { font-weight: bold; margin-bottom: 6px; display: block; }
+    #log { height: 140px; overflow-y: scroll; white-space: pre-wrap; font-family: monospace; font-size: 11px; color: #ffffff;
+           border: 1px solid var(--uxp-host-border-color, #555); padding: 4px; }
+  </style>
+</head>
+<body>
+  <sp-body size="S" id="status">Starting...</sp-body>
+  <div class="section">
+    <sp-detail>CLAUDE'S WRITABLE FOLDER</sp-detail>
+    <sp-body size="S" class="label" id="project">Project:</sp-body>
+    <sp-body size="S" class="label" id="folder">Folder: Not set</sp-body>
+    <sp-body size="XS" class="label muted" id="open">Open projects: 0</sp-body>
+    <div class="row">
+      <sp-button size="s" variant="primary" id="browse">Browse...</sp-button>
+      <sp-button size="s" variant="secondary" id="clear">Clear</sp-button>
+      <sp-button size="s" variant="secondary" id="forget">Forget default</sp-button>
+    </div>
+  </div>
+  <div class="section">
+    <sp-checkbox id="pause">Pause Claude (refuse all commands)</sp-checkbox>
+    <sp-checkbox id="harness">Allow test harness (until reload)</sp-checkbox>
+  </div>
+  <sp-detail>COMMAND LOG</sp-detail>
+  <div id="log"></div>
+  <script src="main.js"></script>
+</body>
+</html>

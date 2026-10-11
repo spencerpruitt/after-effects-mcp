@@ -39,7 +39,7 @@ const cases = [
   ["drive-letter and name case", SHOT.toUpperCase().replace("D:", "d:") + "\\x.jsx", true],
   ["dot segments that stay inside", SHOT + "\\a\\.\\..\\x.jsx", true],
   ["prefix collision SH010b", SHOT + "b\\x.jsx", false],
-  ["sibling shot", SHOT.replace("SH010", "SH011") + "\\x.jsx", false],
+  ["sibling shot", SHOT.replace("SH010", "SH020") + "\\x.jsx", false],
   [".. escape to parent", SHOT + "\\..\\x.jsx", false],
   [".. escape then back in by name", SHOT + "\\..\\SH010\\x.jsx", true],
   ["deep .. escape", SHOT + "\\a\\..\\..\\..\\MyFilm.aep", false],

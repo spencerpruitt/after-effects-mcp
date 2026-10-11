@@ -1,0 +1,28 @@
+{
+  "manifestVersion": 5,
+  "id": "com.mcp.premiere.bridge",
+  "name": "MCP Bridge",
+  "version": "1.0.4",
+  "main": "index.html",
+  "host": {
+    "app": "premierepro",
+    "minVersion": "25.6"
+  },
+  "entrypoints": [
+    {
+      "type": "panel",
+      "id": "mcpBridge",
+      "label": {
+        "default": "MCP Bridge"
+      },
+      "minimumSize": { "width": 260, "height": 240 },
+      "maximumSize": { "width": 2000, "height": 2000 },
+      "preferredDockedSize": { "width": 320, "height": 420 },
+      "preferredFloatingSize": { "width": 360, "height": 480 }
+    }
+  ],
+  "requiredPermissions": {
+    "localFileSystem": "fullAccess",
+    "allowCodeGenerationFromStrings": true
+  }
+}
